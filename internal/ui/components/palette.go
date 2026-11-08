@@ -18,6 +18,7 @@ func DefaultCommands() []Command {
 		{"btw", "One-shot answer from the session's context without adding to the conversation"},
 		{"cd", "Change working directory"},
 		{"clear", "Clear session"},
+		{"commands", "Open the command menu"},
 		{"compact", "Compact session"},
 		{"connect", "Connect an integration"},
 		{"continue", "Switch session"},

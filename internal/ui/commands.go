@@ -21,6 +21,10 @@ func (m Model) runCommand(name string) (nm Model, cmd tea.Cmd, ran bool) {
 		return nm, cmd, true
 	case "exit":
 		return m, tea.Quit, true
+	case "commands":
+		m.input = m.input.Reset()
+		m.dialog = m.dialog.Open()
+		return m, nil, true
 	}
 	return m, nil, false
 }
@@ -43,4 +47,20 @@ func (m Model) copyLast() (Model, tea.Cmd) {
 	}
 	m, clear := m.setNotice("✓ Copied last response")
 	return m, tea.Batch(tea.SetClipboard(text), copyToClipboard(text), clear)
+}
+
+// runAction runs an action chosen in the command dialog.
+func (m Model) runAction(id string) (tea.Model, tea.Cmd) {
+	switch id {
+	case "sidebar":
+		m.sidebarOpen = !m.sidebarOpen
+		return m.layout(), nil
+	case "paste":
+		return m, pasteCmd()
+	}
+	if nm, cmd, ran := m.runCommand(id); ran {
+		return nm.layout(), cmd
+	}
+	nm, cmd := m.setNotice("Not implemented yet")
+	return nm, cmd
 }

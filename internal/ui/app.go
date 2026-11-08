@@ -48,6 +48,7 @@ chat    components.ChatModel
 input   components.InputModel
 sidebar components.SidebarModel
 palette components.PaletteModel
+dialog  components.DialogModel // command menu (ctrl+p / ctrl+k)
 
 sidebarOpen bool // ctrl+d
 notice      string
@@ -66,6 +67,7 @@ chat:    components.NewChat(80, 20),
 input:   components.NewInput(80).SetPlaceholder("Ask anything"),
 sidebar: components.NewSidebar().SetSessionID("78393329910").SetVersion(version.Version).SetCwd(cwdLabel()), // TODO: real session id
 palette: components.NewPalette(components.DefaultCommands()),
+dialog:  components.NewDialog(components.DefaultDialogItems()),
 cfg:     cfg,
 screen:  ScreenHome,
 sidebarOpen: true,
@@ -83,6 +85,7 @@ return tea.Tick(30*time.Millisecond, func(time.Time) tea.Msg { return tickMsg{} 
 func (m Model) layout() Model {
 // the slash-command popup follows whatever is typed in the input
 m.palette = m.palette.Sync(m.input.Value())
+m.dialog = m.dialog.SetSize(m.width, m.height)
 if m.width < minW || m.height < minH {
 return m
 }
@@ -177,6 +180,16 @@ m.chat = m.chat.ScrollDown(3)
 return m, nil
 
 case tea.KeyPressMsg:
+if m.dialog.Visible() { // modal: it owns the keyboard while open
+var res components.DialogResult
+m.dialog, res = m.dialog.Update(msg)
+if res == components.DialogChose {
+if it, ok := m.dialog.Selected(); ok {
+return m.runAction(it.ID)
+}
+}
+return m, nil
+}
 if m.palette.Visible() {
 switch msg.String() {
 case "up", "ctrl+p":
@@ -214,6 +227,10 @@ return m.layout(), nil
 case "ctrl+l":
 m.chat = m.chat.Clear()
 return m.layout(), nil
+
+case "ctrl+p", "ctrl+k":
+m.dialog = m.dialog.Open()
+return m, nil
 
 case "ctrl+d":
 m.sidebarOpen = !m.sidebarOpen
@@ -300,6 +317,12 @@ mainCol, m.sidebar.SetContext(in, out, contextWindow).View(),
 } else {
 content = mainCol
 }
+}
+
+if m.dialog.Visible() && m.width >= minW && m.height >= minH {
+bw, bh := m.dialog.Size()
+top := (m.height - bh) / 2
+content = components.OverlayString(content, m.dialog.View(), (m.width-bw)/2, top+bh)
 }
 
 v := tea.NewView(content)
