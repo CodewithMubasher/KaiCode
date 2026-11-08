@@ -21,12 +21,14 @@ type Config struct {
 	MaxSteps    int           // model turns per Run (default 30)
 	MaxRepairs  int           // retries for unreadable tool calls per Run (default 2)
 	ToolTimeout time.Duration // per tool call (default 60s)
+	Record      func(Entry)   // called for every history entry (session log); may be nil
 }
 
 // Entry is one item of Kai's own record of the conversation (context #2).
 type Entry struct {
-	Role string // "user", "assistant" or "tool"
-	Text string
+	Role string    `json:"role"` // "user", "assistant" or "tool"
+	Text string    `json:"text"`
+	At   time.Time `json:"at"`
 }
 
 // Agent runs requests against a provider. It keeps the chat's position so
@@ -37,7 +39,8 @@ type Agent struct {
 
 	mu      sync.Mutex
 	parent  *int
-	started bool
+	started bool   // the current web chat has been given Kai's instructions
+	recap   string // recap to put in front of the next first message, after a lost chat
 	history []Entry
 }
 
@@ -60,7 +63,7 @@ func New(cfg Config) *Agent {
 // Reset forgets the chat so the next Run starts a new one.
 func (a *Agent) Reset(ctx context.Context) {
 	a.mu.Lock()
-	a.parent, a.started, a.history = nil, false, nil
+	a.parent, a.started, a.recap, a.history = nil, false, "", nil
 	a.mu.Unlock()
 	if s, ok := a.cfg.Provider.(Sessioner); ok {
 		_ = s.NewSession(ctx)
@@ -75,9 +78,13 @@ func (a *Agent) History() []Entry {
 }
 
 func (a *Agent) record(role, text string) {
+	e := Entry{Role: role, Text: text, At: time.Now()}
 	a.mu.Lock()
-	a.history = append(a.history, Entry{Role: role, Text: text})
+	a.history = append(a.history, e)
 	a.mu.Unlock()
+	if a.cfg.Record != nil {
+		a.cfg.Record(e)
+	}
 }
 
 func (a *Agent) parentID() *int {
@@ -86,9 +93,13 @@ func (a *Agent) parentID() *int {
 	return a.parent
 }
 
+// setParent is called when a reply begins: the chat now exists, so later
+// messages continue it instead of repeating the instructions.
 func (a *Agent) setParent(id int) {
 	a.mu.Lock()
 	a.parent = &id
+	a.started = true
+	a.recap = ""
 	a.mu.Unlock()
 }
 
@@ -111,25 +122,47 @@ func (a *Agent) Run(ctx context.Context, user string) <-chan Event {
 	return out
 }
 
-func (a *Agent) firstPrompt(user string) string {
+// prepare wraps body for sending. The first message of a chat also carries
+// Kai's instructions and the tool block (the web chat has no system role).
+// After a lost chat it carries a recap of the conversation too.
+func (a *Agent) prepare(body string) string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.started {
-		return user
+		return body
 	}
-	a.started = true
-	return dsml.FirstPrompt(a.cfg.System, a.cfg.Tools.Specs(), user)
+	if a.recap != "" {
+		body = "The earlier chat was lost, so this is a fresh chat. Recap of the conversation so far:\n\n" +
+			a.recap + "\n\nContinue from here.\n\n" + body
+	}
+	return dsml.FirstPrompt(a.cfg.System, a.cfg.Tools.Specs(), body)
+}
+
+// restartChat drops the web chat's position and prepares a recap from Kai's
+// own record, so the next message opens a new chat that knows what happened.
+func (a *Agent) restartChat() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.parent, a.started = nil, false
+	a.recap = recap(a.history, recapBudget)
 }
 
 func (a *Agent) loop(ctx context.Context, user string, emit func(Event) bool) {
 	a.record("user", user)
-	prompt := a.firstPrompt(user)
+	body := user // what to say next, without Kai's instructions
 	repairs := 0
+	recovered := false
 
 	for step := 0; step < a.cfg.MaxSteps; step++ {
-		res, err := a.turn(ctx, prompt, emit)
+		res, err := a.turn(ctx, a.prepare(body), emit)
 		if ctx.Err() != nil {
 			return // stopped by the user
+		}
+		if errors.Is(err, ErrChatLost) && !recovered {
+			recovered = true // once per request, so a broken bridge cannot loop forever
+			a.restartChat()
+			step-- // this attempt does not count
+			continue
 		}
 		if err != nil {
 			emit(Event{Kind: EvError, Err: err})
@@ -149,7 +182,7 @@ func (a *Agent) loop(ctx context.Context, user string, emit func(Event) bool) {
 				return
 			}
 			repairs++
-			prompt = dsml.RepairPrompt(res.problem)
+			body = dsml.RepairPrompt(res.problem)
 			continue
 		}
 
@@ -169,7 +202,7 @@ func (a *Agent) loop(ctx context.Context, user string, emit func(Event) bool) {
 			a.record("tool", r.Output)
 			results = append(results, r)
 		}
-		prompt = dsml.EncodeResults(results)
+		body = dsml.EncodeResults(results)
 	}
 	emit(Event{Kind: EvError, Err: fmt.Errorf("stopped after %d steps without a final answer", a.cfg.MaxSteps)})
 }

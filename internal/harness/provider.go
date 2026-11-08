@@ -1,6 +1,15 @@
 package harness
 
-import "context"
+import (
+	"context"
+	"errors"
+)
+
+// ErrChatLost means the chat on the provider side is gone or is no longer the
+// one Kai started (the user opened another chat, the page was reloaded). The
+// agent recovers by starting a fresh chat and replaying a recap of its own
+// record of the conversation.
+var ErrChatLost = errors.New("the web chat was lost")
 
 // Turn is one message sent to the model.
 type Turn struct {

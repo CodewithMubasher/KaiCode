@@ -1,0 +1,20 @@
+<!doctype html>
+<meta charset="utf-8" />
+<style>
+  body { font: 13px system-ui, sans-serif; width: 300px; margin: 12px; }
+  label { display: block; margin: 8px 0 2px; color: #555; }
+  input { width: 100%; box-sizing: border-box; padding: 5px; }
+  button { margin-top: 10px; padding: 5px 12px; }
+  #state { margin-top: 10px; font-weight: 600; }
+  .ok { color: #1a7f5a; } .bad { color: #b3261e; }
+  small { color: #777; display: block; margin-top: 8px; }
+</style>
+<h3 style="margin:0 0 6px">Kai Bridge</h3>
+<label for="addr">Kai address</label>
+<input id="addr" placeholder="http://127.0.0.1:8765" />
+<label for="token">Token (run <code>kai token</code>)</label>
+<input id="token" type="password" />
+<button id="save">Save</button>
+<div id="state">…</div>
+<small>Keep a logged-in chat.deepseek.com tab open. Kai reuses that tab.</small>
+<script src="popup.js"></script>

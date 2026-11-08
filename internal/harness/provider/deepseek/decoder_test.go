@@ -118,3 +118,25 @@ func TestNewRequestShape(t *testing.T) {
 		t.Errorf("request = %+v", r)
 	}
 }
+
+// A follow-up turn in an existing chat (search_enabled, no title event).
+func TestDecodeSecondCapture(t *testing.T) {
+	f, err := os.Open("testdata/continue.sse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	evs := collect(t, Decode(context.Background(), f))
+
+	want := "Hi there! What's on your mind? I'm happy to help with a question, a task, or just a chat."
+	if got := textOf(evs, harness.StreamText); got != want {
+		t.Errorf("text = %q", got)
+	}
+	if evs[0].Kind != harness.StreamReady || evs[0].MessageID != 4 {
+		t.Errorf("first event = %+v, want ready with id 4", evs[0])
+	}
+	if last := evs[len(evs)-1]; last.Kind != harness.StreamEnd || last.Text != "FINISHED" {
+		t.Errorf("last event = %+v", last)
+	}
+}

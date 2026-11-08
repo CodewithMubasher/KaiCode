@@ -275,3 +275,91 @@ func TestDemoScriptRunsEndToEnd(t *testing.T) {
 		t.Errorf("last event = %+v", evs[len(evs)-1])
 	}
 }
+
+// flaky wraps a provider and reports the chat as lost on one chosen call.
+type flaky struct {
+	inner   *MockProvider
+	failOn  int
+	calls   int
+	prompts []string
+	parents []*int
+}
+
+func (f *flaky) Send(ctx context.Context, t Turn) (<-chan StreamEvent, error) {
+	f.calls++
+	f.prompts = append(f.prompts, t.Prompt)
+	f.parents = append(f.parents, t.ParentID)
+	if f.calls == f.failOn {
+		return nil, ErrChatLost
+	}
+	return f.inner.Send(ctx, t)
+}
+
+func TestLostChatIsRestartedWithARecap(t *testing.T) {
+	reg := tools.NewRegistry()
+	reg.Register(echoTool{})
+	f := &flaky{failOn: 2, inner: &MockProvider{Script: func(n int, tn Turn) string {
+		if n == 0 {
+			return "Checking.\n" + call("echo", "hi")
+		}
+		return "ok"
+	}}}
+	a := New(Config{Provider: f, Tools: reg, System: "sys"})
+
+	evs := drain(t, a.Run(context.Background(), "do it"))
+
+	if evs[len(evs)-1].Kind != EvDone {
+		t.Fatalf("last event = %+v", evs[len(evs)-1])
+	}
+	if f.calls != 3 {
+		t.Fatalf("provider calls = %d, want 3", f.calls)
+	}
+	retry := f.prompts[2]
+	for _, want := range []string{"<kai_instructions>", "Recap", "User: do it", "Assistant: Checking.", "<tool_result>\necho:hi"} {
+		if !strings.Contains(retry, want) {
+			t.Errorf("retry prompt is missing %q:\n%s", want, retry)
+		}
+	}
+	if f.parents[2] != nil {
+		t.Error("the retry must open a new chat (no parent id)")
+	}
+}
+
+func TestLostChatIsOnlyRetriedOnce(t *testing.T) {
+	a := New(Config{Provider: failProvider{ErrChatLost}})
+	evs := drain(t, a.Run(context.Background(), "hi"))
+	last := evs[len(evs)-1]
+	if last.Kind != EvError {
+		t.Fatalf("last event = %+v", last)
+	}
+}
+
+// failFirst fails the first Send with a plain error, then delegates.
+type failFirst struct {
+	inner  Provider
+	failed bool
+}
+
+func (f *failFirst) Send(ctx context.Context, t Turn) (<-chan StreamEvent, error) {
+	if !f.failed {
+		f.failed = true
+		return nil, errors.New("bridge down")
+	}
+	return f.inner.Send(ctx, t)
+}
+
+// If the first send never reached the chat, the retry must still carry the
+// instructions: the chat has not started.
+func TestFailedFirstSendKeepsInstructionsForTheNextTry(t *testing.T) {
+	var prompts []string
+	mp := &MockProvider{Script: func(n int, tn Turn) string {
+		prompts = append(prompts, tn.Prompt)
+		return "ok"
+	}}
+	a := New(Config{Provider: &failFirst{inner: mp}})
+	drain(t, a.Run(context.Background(), "one"))
+	drain(t, a.Run(context.Background(), "two"))
+	if len(prompts) != 1 || !strings.Contains(prompts[0], "<kai_instructions>") {
+		t.Fatalf("prompts = %q", prompts)
+	}
+}

@@ -3,11 +3,17 @@ package ui
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
 
+	"kai/internal/bridge"
 	"kai/internal/config"
 	"kai/internal/harness"
 	"kai/internal/tools"
@@ -36,20 +42,78 @@ type (
 	agentDoneMsg struct{ id int }
 )
 
-// newRunState builds the agent.
-//
-// Until the Chrome bridge exists (Phase 5) there is no live DeepSeek session
-// to talk to, so every provider name runs the scripted demo provider. The
-// loop, the DSML parsing and the tools are the real ones.
+// newRunState builds the agent. Provider "mock" runs a scripted demo that
+// needs no browser; anything else starts the bridge for the Chrome extension.
 func newRunState(cfg *config.Config) runState {
 	reg := tools.NewRegistry()
 	reg.Register(tools.ReadFile{})
-	provider := &harness.MockProvider{Script: harness.DemoScript, ChunkRunes: 4, Delay: 15 * time.Millisecond}
+
+	var provider harness.Provider
+	if cfg.Provider.Name == "mock" {
+		provider = &harness.MockProvider{Script: harness.DemoScript, ChunkRunes: 4, Delay: 15 * time.Millisecond}
+	} else {
+		provider = startBridge(cfg)
+	}
+
 	return runState{agent: harness.New(harness.Config{
 		Provider: provider,
 		Tools:    reg,
 		System:   kaiSystem,
+		Record:   sessionLogger(cfg.Session.Dir),
 	})}
+}
+
+// startBridge opens the local port the Chrome extension connects to. If that
+// fails, every send reports why instead of the app refusing to start.
+func startBridge(cfg *config.Config) harness.Provider {
+	addr := cfg.Provider.Addr
+	if addr == "" {
+		addr = "127.0.0.1:8765"
+	}
+	token, err := bridge.LoadOrCreateToken(config.KaiDir())
+	if err != nil {
+		return brokenProvider{fmt.Errorf("bridge token: %w", err)}
+	}
+	srv, err := bridge.Start(addr, token, slog.Default())
+	if err != nil {
+		return brokenProvider{fmt.Errorf("could not start the bridge on %s (is another Kai running?): %w", addr, err)}
+	}
+	return srv
+}
+
+type brokenProvider struct{ err error }
+
+func (b brokenProvider) Send(ctx context.Context, t harness.Turn) (<-chan harness.StreamEvent, error) {
+	return nil, b.err
+}
+
+// sessionLogger appends every history entry to a JSON-lines file in dir, one
+// file per Kai run. This is Kai's own record of the conversation, kept on
+// disk next to the provider's copy.
+func sessionLogger(dir string) func(harness.Entry) {
+	if dir == "" {
+		return nil
+	}
+	var mu sync.Mutex
+	var f *os.File
+	return func(e harness.Entry) {
+		mu.Lock()
+		defer mu.Unlock()
+		if f == nil {
+			if os.MkdirAll(dir, 0o755) != nil {
+				return
+			}
+			name := filepath.Join(dir, time.Now().Format("20060102-150405")+".jsonl")
+			file, err := os.OpenFile(name, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+			if err != nil {
+				return
+			}
+			f = file
+		}
+		if b, err := json.Marshal(e); err == nil {
+			_, _ = f.Write(append(b, '\n'))
+		}
+	}
 }
 
 // startRun sends text to the agent and starts listening for its events.

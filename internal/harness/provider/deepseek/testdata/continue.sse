@@ -1,0 +1,68 @@
+event: ready
+data: {"request_message_id":3,"response_message_id":4,"model_type":"default"}
+
+event: update_session
+data: {"updated_at":1794164405.448091}
+
+data: {"v":{"response":{"message_id":4,"parent_id":3,"model":"","role":"ASSISTANT","thinking_enabled":false,"ban_edit":false,"ban_regenerate":false,"status":"WIP","incomplete_message":null,"accumulated_token_usage":43,"feedback":null,"inserted_at":1794164405.4369779,"search_enabled":true,"fragments":[{"id":2,"type":"RESPONSE","content":"Hi","references":[],"stage_id":1}],"conversation_mode":"DEFAULT","has_pending_fragment":false,"auto_continue":false,"search_triggered":false,"extra_search_providers":[]}}}
+
+data: {"p":"response/fragments/-1/content","o":"APPEND","v":" there"}
+
+data: {"v":"!"}
+
+data: {"v":" What"}
+
+data: {"v":"'s"}
+
+data: {"v":" on"}
+
+data: {"v":" your"}
+
+data: {"v":" mind"}
+
+data: {"v":"?"}
+
+data: {"v":" I"}
+
+data: {"v":"'m"}
+
+data: {"v":" happy"}
+
+data: {"v":" to"}
+
+data: {"v":" help"}
+
+data: {"v":" with"}
+
+data: {"v":" a"}
+
+data: {"v":" question"}
+
+data: {"v":","}
+
+data: {"v":" a"}
+
+data: {"v":" task"}
+
+data: {"v":","}
+
+data: {"v":" or"}
+
+data: {"v":" just"}
+
+data: {"v":" a"}
+
+data: {"v":" chat"}
+
+data: {"v":"."}
+
+data: {"p":"response","o":"BATCH","v":[{"p":"accumulated_token_usage","v":90},{"p":"quasi_status","v":"FINISHED"}]}
+
+data: {"p":"response/status","o":"SET","v":"FINISHED"}
+
+event: update_session
+data: {"updated_at":1794164405.659057}
+
+event: close
+data: {"click_behavior":"none","auto_resume":false}
+
