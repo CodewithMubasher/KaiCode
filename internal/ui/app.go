@@ -53,6 +53,7 @@ input   components.InputModel
 sidebar components.SidebarModel
 palette components.PaletteModel
 dialog  components.DialogModel // command menu (ctrl+p / ctrl+k)
+run     runState               // the agent and the request in flight
 
 sidebarOpen bool // ctrl+d
 notice      string
@@ -73,6 +74,7 @@ sidebar: components.NewSidebar().SetSessionID("78393329910").SetVersion(version.
 palette: components.NewPalette(components.DefaultCommands()),
 dialog:  components.NewDialog(components.DefaultDialogItems()),
 cfg:     cfg,
+run:     newRunState(cfg),
 screen:  ScreenHome,
 sidebarOpen: true,
 state:   StateIdle,
@@ -150,6 +152,16 @@ m.fake = nil
 return m, nil
 }
 return m, tick()
+
+case agentMsg:
+if msg.id != m.run.id { // from a request that was stopped
+return m, nil
+}
+m = m.applyEvent(msg.ev)
+return m.layout(), waitEvent(m.run.id, m.run.events)
+
+case agentDoneMsg:
+return m, nil
 
 case noticeClearMsg:
 if msg.seq == m.noticeSeq {
@@ -238,6 +250,7 @@ return m, nil
 switch msg.String() {
 case "ctrl+c", "esc":
 if msg.String() == "esc" && m.chat.Active() { // esc stops a running reply
+m = m.stopRun()
 m.chat = m.chat.Stop()
 m.state, m.fake = StateIdle, nil
 return m.layout(), nil
@@ -293,8 +306,9 @@ m.screen = ScreenChat
 m.chat = m.chat.AppendUser(text).StartReply()
 m.input = m.input.Reset().SetPlaceholder("Type a message...")
 m.state = StateThinking
-m.fake = newFakeStream()
-return m.layout(), tick()
+var wait tea.Cmd
+m, wait = m.startRun(text)
+return m.layout(), tea.Batch(tick(), wait)
 }
 }
 

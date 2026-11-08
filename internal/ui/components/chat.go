@@ -170,18 +170,40 @@ func (c ChatModel) cloneSteps() []liveStep {
 // Stop cuts the running reply short (esc). Whatever is already on screen is
 // kept as a normal message and flagged Stopped, so the chat ends it with a
 // STOPPED marker. Text that was queued but not yet typed is dropped.
-func (c ChatModel) Stop() ChatModel {
+func (c ChatModel) Stop() ChatModel { return c.cut(true) }
+
+// Fail ends the running reply the same way, without the STOPPED marker, and
+// adds an error row under it.
+func (c ChatModel) Fail(text string) ChatModel { return c.cut(false).AppendError(text) }
+
+// DemoteAnswer turns the answer text typed so far into a finished thought.
+// The harness calls it when a tool call follows some text: that text was the
+// model thinking out loud, not the final answer.
+func (c ChatModel) DemoteAnswer() ChatModel {
+	if !c.active || len(c.live.answer) == 0 {
+		return c
+	}
+	steps := c.cloneSteps()
+	steps = append(steps, liveStep{kind: StepThinking, think: c.live.answer, thinkDone: true, took: time.Second})
+	c.live.steps = steps
+	c.live.answer = nil
+	c.live.answerShown = 0
+	c.live.answerDone = false
+	return c
+}
+
+func (c ChatModel) cut(stopped bool) ChatModel {
 	if !c.active {
 		return c
 	}
 	l := c.live
-	msg := Message{Role: RoleAssistant, Stopped: true}
-	cut := firstUnfinished(l.steps) // the step that was in progress, or -1
+	msg := Message{Role: RoleAssistant, Stopped: stopped}
+	cutAt := firstUnfinished(l.steps) // the step that was in progress, or -1
 	for i, s := range l.steps {
-		if cut >= 0 && i > cut {
+		if cutAt >= 0 && i > cutAt {
 			break // never shown yet
 		}
-		if i == cut {
+		if i == cutAt {
 			switch s.kind {
 			case StepThinking:
 				n := min(s.shown, len(s.think))
@@ -198,10 +220,12 @@ func (c ChatModel) Stop() ChatModel {
 		}
 		msg.Steps = append(msg.Steps, s.toStep())
 	}
-	if cut < 0 {
+	if cutAt < 0 {
 		msg.Text = string(l.answer[:min(l.answerShown, len(l.answer))])
 	}
-	c.messages = append(c.messages, msg)
+	if stopped || len(msg.Steps) > 0 || msg.Text != "" {
+		c.messages = append(c.messages, msg)
+	}
 	c.active = false
 	c.live = liveReply{}
 	c.hovering = false

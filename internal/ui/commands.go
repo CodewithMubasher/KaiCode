@@ -1,6 +1,8 @@
 package ui
 
 import (
+	"context"
+
 	tea "charm.land/bubbletea/v2"
 )
 
@@ -11,6 +13,8 @@ func (m Model) runCommand(name string) (nm Model, cmd tea.Cmd, ran bool) {
 	case "new":
 		return m.newSession(), nil, true
 	case "clear":
+		m = m.stopRun()
+		m.run.agent.Reset(context.Background())
 		m.chat = m.chat.Clear()
 		m.input = m.input.Reset()
 		m.state, m.fake = StateIdle, nil
@@ -31,6 +35,8 @@ func (m Model) runCommand(name string) (nm Model, cmd tea.Cmd, ran bool) {
 
 // newSession drops the conversation and goes back to the home screen.
 func (m Model) newSession() Model {
+	m = m.stopRun()
+	m.run.agent.Reset(context.Background())
 	m.chat = m.chat.Clear()
 	m.input = m.input.Reset().SetPlaceholder("Ask anything")
 	m.screen = ScreenHome
