@@ -565,24 +565,32 @@ func (c ChatModel) Click(x, y int) ChatModel {
 // words counts whitespace-separated words in s.
 func words(s string) int { return len(strings.Fields(s)) }
 
-// Words counts every word in the conversation as it stands right now,
-// including the part of the live reply that has been typed so far.
-func (c ChatModel) Words() int {
-	n := 0
+// wordCounts counts the words in the conversation as it stands right now,
+// including the part of the live reply typed so far. "in" is what is fed to
+// the model (user messages, command output); "out" is what the model wrote
+// (thinking, tool calls, edits, answers). The whole history is counted, so a
+// second turn is everything before it plus the new messages.
+func (c ChatModel) wordCounts() (in, out int) {
 	for _, m := range c.messages {
-		n += words(m.Text)
+		switch m.Role {
+		case RoleUser:
+			in += words(m.Text)
+		case RoleAssistant:
+			out += words(m.Text)
+		}
 		for _, st := range m.Steps {
 			switch st.Kind {
 			case StepThinking:
 				for _, nd := range st.Timeline.Nodes {
-					n += words(nd.Content)
+					out += words(nd.Content)
 				}
 			case StepReadFile:
-				n += words("Read file " + st.Path)
+				out += words("Read file " + st.Path)
 			case StepShell:
-				n += words(st.Command) + words(st.Output)
+				out += words(st.Command)
+				in += words(st.Output)
 			case StepEdit:
-				n += words(st.Path) + diffWords(st.Diff)
+				out += words(st.Path) + diffWords(st.Diff)
 			}
 		}
 	}
@@ -590,18 +598,19 @@ func (c ChatModel) Words() int {
 		for _, s := range c.live.steps {
 			switch s.kind {
 			case StepThinking:
-				n += words(string(s.think[:s.shown]))
+				out += words(string(s.think[:s.shown]))
 			case StepReadFile:
-				n += words("Read file " + s.path)
+				out += words("Read file " + s.path)
 			case StepShell:
-				n += words(s.cmd) + words(string(s.out[:s.shown]))
+				out += words(s.cmd)
+				in += words(string(s.out[:s.shown]))
 			case StepEdit:
-				n += words(s.path) + diffWords(s.diff[:s.shown])
+				out += words(s.path) + diffWords(s.diff[:s.shown])
 			}
 		}
-		n += words(string(c.live.answer[:c.live.answerShown]))
+		out += words(string(c.live.answer[:c.live.answerShown]))
 	}
-	return n
+	return in, out
 }
 
 func diffWords(d []DiffLine) int {
@@ -612,9 +621,24 @@ func diffWords(d []DiffLine) int {
 	return n
 }
 
-// Tokens estimates the context used: words * 1.3, rounded.
-func (c ChatModel) Tokens() int {
-	return int(math.Round(float64(c.Words()) * 1.3))
+// tokensPerWord is the rough conversion used for the context estimate.
+const tokensPerWord = 1.3
+
+// TokenCounts estimates input and output tokens: words * 1.3, rounded.
+// The context used is their sum.
+func (c ChatModel) TokenCounts() (in, out int) {
+	wi, wo := c.wordCounts()
+	return int(math.Round(float64(wi) * tokensPerWord)), int(math.Round(float64(wo) * tokensPerWord))
+}
+
+// LastAnswer returns the text of the last assistant reply ("" if none).
+func (c ChatModel) LastAnswer() string {
+	for i := len(c.messages) - 1; i >= 0; i-- {
+		if c.messages[i].Role == RoleAssistant {
+			return c.messages[i].Text
+		}
+	}
+	return ""
 }
 
 func (c ChatModel) View() string {

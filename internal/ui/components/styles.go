@@ -27,6 +27,7 @@ ColOnTeal color.Color = lipgloss.Color("#000000") // text on the highlight
 ColPopup  color.Color = lipgloss.Color("#111111") // popup background
 
 // Shell / edit cards: dim white bar and diff colours.
+ColShellBg color.Color = lipgloss.Color("#131313") // shell card, a touch darker than ColPanel
 ColBarDim  color.Color = lipgloss.Color("#5a5a5a") // white at reduced opacity
 ColDelBg   color.Color = lipgloss.Color("#3b222a")
 ColAddBg   color.Color = lipgloss.Color("#1c3440")

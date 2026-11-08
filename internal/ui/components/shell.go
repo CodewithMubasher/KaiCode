@@ -23,7 +23,7 @@ func shellLines(cmd, output string, w int) []string {
 		inner = 1
 	}
 
-	bg := lipgloss.NewStyle().Background(ColPanel)
+	bg := lipgloss.NewStyle().Background(ColShellBg)
 	cmdStyle := bg.Foreground(ColText).Bold(true)
 	outStyle := bg.Foreground(ColDim)
 
@@ -45,5 +45,5 @@ func shellLines(cmd, output string, w int) []string {
 			}
 		}
 	}
-	return withBar(append(out, blank))
+	return withBar(append(out, blank), ColShellBg)
 }

@@ -1,16 +1,20 @@
 package components
 
-import "charm.land/lipgloss/v2"
+import (
+	"image/color"
+
+	"charm.land/lipgloss/v2"
+)
 
 // cardBar is the left bar of shell and edit cards: the same "▍" the input
 // uses, but white at reduced opacity instead of the accent colour.
-func cardBar() string {
-	return lipgloss.NewStyle().Foreground(ColBarDim).Background(ColPanel).Render("▍")
+func cardBar(bg color.Color) string {
+	return lipgloss.NewStyle().Foreground(ColBarDim).Background(bg).Render("▍")
 }
 
 // withBar prefixes every row with the card bar.
-func withBar(rows []string) []string {
-	bar := cardBar()
+func withBar(rows []string, bg color.Color) []string {
+	bar := cardBar(bg)
 	out := make([]string, len(rows))
 	for i, r := range rows {
 		out[i] = bar + r

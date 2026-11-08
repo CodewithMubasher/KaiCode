@@ -21,7 +21,7 @@ type SidebarModel struct {
 	sessionID string
 	version   string
 
-	tokens, total int
+	tokensIn, tokensOut, total int
 	cwd           string
 	hoverCwd      bool
 }
@@ -43,9 +43,10 @@ func (s SidebarModel) SetVersion(v string) SidebarModel {
 	return s
 }
 
-// SetContext sets the tokens used and the size of the context window.
-func (s SidebarModel) SetContext(tokens, total int) SidebarModel {
-	s.tokens, s.total = tokens, total
+// SetContext sets the input and output tokens so far and the size of the
+// context window. The context used is input + output.
+func (s SidebarModel) SetContext(in, out, total int) SidebarModel {
+	s.tokensIn, s.tokensOut, s.total = in, out, total
 	return s
 }
 
@@ -58,7 +59,7 @@ func (s SidebarModel) SetCwd(label string) SidebarModel {
 // cwdRow is the panel row holding the working directory (-1 if no room).
 func (s SidebarModel) cwdRow() int {
 	r := s.h - 2
-	if r < 6 {
+	if r < 8 {
 		return -1
 	}
 	return r
@@ -135,8 +136,10 @@ func (s SidebarModel) View() string {
 	// Row 0 is empty (matches the chat's top padding).
 	set(1, bright.Render("KAI CODE")+bg.Render(" ")+bg.Foreground(ColMuted).Render("v"+s.version))
 	set(3, bright.Render("Context"))
-	set(4, dim.Render(commas(s.tokens)+" tokens"))
-	set(5, dim.Render(percent(s.tokens, s.total)+" used"))
+	used := s.tokensIn + s.tokensOut
+	set(4, dim.Render(commas(used)+" tokens"))
+	set(5, dim.Render(percent(used, s.total)+" used"))
+	set(6, dim.Render("in "+commas(s.tokensIn)+" · out "+commas(s.tokensOut)))
 
 	if r := s.cwdRow(); r >= 0 && s.cwd != "" {
 		st := dim

@@ -141,5 +141,5 @@ func editLines(path string, diff []DiffLine, w int) []string {
 			out = append(out, bg.Render(spaces(lead))+row+bg.Render(spaces(tail)))
 		}
 	}
-	return withBar(append(out, blank))
+	return withBar(append(out, blank), ColPanel)
 }

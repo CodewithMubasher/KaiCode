@@ -16,6 +16,9 @@ tea "charm.land/bubbletea/v2"
 // contextWindow is the model context size the sidebar measures against.
 const contextWindow = 256_000
 
+// sidebarMinTerm is the terminal width below which the sidebar hides itself.
+const sidebarMinTerm = 100
+
 const (
 minW = 60
 minH = 14
@@ -46,6 +49,10 @@ input   components.InputModel
 sidebar components.SidebarModel
 palette components.PaletteModel
 
+sidebarOpen bool // ctrl+d
+notice      string
+noticeSeq   int
+
 screen Screen
 state  AppState
 fake   *fakeStream
@@ -61,6 +68,7 @@ sidebar: components.NewSidebar().SetSessionID("78393329910").SetVersion(version.
 palette: components.NewPalette(components.DefaultCommands()),
 cfg:     cfg,
 screen:  ScreenHome,
+sidebarOpen: true,
 state:   StateIdle,
 }
 }
@@ -89,9 +97,12 @@ m.input = m.input.SetWidth(inputW + 2*components.Margin)
 return m
 }
 
-sideW := m.width * 24 / 100
+sideW := 0
+if m.sidebarOpen && m.width >= sidebarMinTerm {
+sideW = m.width * 24 / 100
 if sideW < 16 {
 sideW = 16
+}
 }
 mainW := m.width - sideW
 m.mainW, m.sideW = mainW, sideW
@@ -133,9 +144,21 @@ return m, nil
 }
 return m, tick()
 
+case noticeClearMsg:
+if msg.seq == m.noticeSeq {
+m.notice = ""
+}
+return m, nil
+
+case tea.ClipboardMsg: // answer to an OSC 52 read, treated as a paste
+m.input, _ = m.input.Update(tea.PasteMsg{Content: msg.Content})
+return m.layout(), nil
+
 case tea.MouseMotionMsg:
 m.chat = m.chat.Hover(msg.X, msg.Y)
+if m.sideW > 0 {
 m.sidebar = m.sidebar.Hover(msg.X-m.mainW, msg.Y)
+}
 return m, nil
 
 case tea.MouseClickMsg:
@@ -159,11 +182,19 @@ switch msg.String() {
 case "up", "ctrl+p":
 m.palette = m.palette.Up()
 return m, nil
-case "down", "ctrl+n":
+case "down":
 m.palette = m.palette.Down()
 return m, nil
-case "tab", "enter":
+case "tab":
 if c, ok := m.palette.Selected(); ok {
+m.input = m.input.SetValue("/" + c.Name + " ")
+}
+return m.layout(), nil
+case "enter":
+if c, ok := m.palette.Selected(); ok {
+if nm, cmd, ran := m.runCommand(c.Name); ran {
+return nm.layout(), cmd
+}
 m.input = m.input.SetValue("/" + c.Name + " ")
 }
 return m.layout(), nil
@@ -184,6 +215,16 @@ case "ctrl+l":
 m.chat = m.chat.Clear()
 return m.layout(), nil
 
+case "ctrl+d":
+m.sidebarOpen = !m.sidebarOpen
+return m.layout(), nil
+
+case "ctrl+n":
+return m.newSession().layout(), nil
+
+case "ctrl+v":
+return m, pasteCmd()
+
 case "pgup":
 m.chat = m.chat.ScrollUp(5)
 return m, nil
@@ -199,6 +240,11 @@ return m, nil
 
 case "enter":
 text := strings.TrimSpace(m.input.Value())
+if f := strings.Fields(text); len(f) > 0 && strings.HasPrefix(f[0], "/") {
+if nm, cmd, ran := m.runCommand(strings.TrimPrefix(f[0], "/")); ran {
+return nm.layout(), cmd
+}
+}
 if text == "" || m.state == StateThinking {
 return m, nil
 }
@@ -230,14 +276,15 @@ block := lipgloss.JoinVertical(lipgloss.Center,
 components.Banner(version.Version),
 "",
 m.input.View(),
+m.noticeRow(m.input.Width()),
 )
 // slash-command popup sits right above the input
-inputTop := lipgloss.Height(block) - m.input.Height()
+inputTop := lipgloss.Height(block) - 1 - m.input.Height() // 1 = notice row
 popupX := (lipgloss.Width(block)-m.input.Width())/2 + components.Margin
 block = components.OverlayString(block, m.palette.View(m.input.Width()-2*components.Margin), popupX, inputTop)
 content = lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Position(0.52), block)
 } else {
-gap := strings.Repeat(" ", m.mainW)
+gap := m.noticeRow(m.mainW)
 mainCol := lipgloss.JoinVertical(lipgloss.Left,
 m.chat.View(),
 m.input.View(),
@@ -245,9 +292,14 @@ gap,
 )
 // slash-command popup sits right above the input
 mainCol = components.OverlayString(mainCol, m.palette.View(m.mainW-2*components.Margin), components.Margin, lipgloss.Height(m.chat.View()))
+if m.sideW > 0 {
+in, out := m.chat.TokenCounts()
 content = lipgloss.JoinHorizontal(lipgloss.Top,
-mainCol, m.sidebar.SetContext(m.chat.Tokens(), contextWindow).View(),
+mainCol, m.sidebar.SetContext(in, out, contextWindow).View(),
 )
+} else {
+content = mainCol
+}
 }
 
 v := tea.NewView(content)
