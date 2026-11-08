@@ -20,7 +20,11 @@ type UIConfig struct {
 }
 
 type ProviderConfig struct {
+	// Name is "deepseek" (the Chrome extension bridge) or "mock" (a scripted
+	// demo that needs no browser).
 	Name string `toml:"name"`
+	// Addr is where the bridge listens for the Chrome extension.
+	Addr string `toml:"addr"`
 }
 
 type SessionConfig struct {
@@ -32,12 +36,17 @@ type LogConfig struct {
 	File  string `toml:"file"`
 }
 
-func Default() *Config {
+// KaiDir is Kai's data directory (~/.kai).
+func KaiDir() string {
 	home, _ := os.UserHomeDir()
-	kaiDir := filepath.Join(home, ".kai")
+	return filepath.Join(home, ".kai")
+}
+
+func Default() *Config {
+	kaiDir := KaiDir()
 	return &Config{
 		UI:       UIConfig{Theme: "default", Mouse: false},
-		Provider: ProviderConfig{Name: "deepseek"},
+		Provider: ProviderConfig{Name: "deepseek", Addr: "127.0.0.1:8765"},
 		Session:  SessionConfig{Dir: filepath.Join(kaiDir, "sessions")},
 		Log:      LogConfig{Level: "info", File: filepath.Join(kaiDir, "logs", "kai.log")},
 	}
