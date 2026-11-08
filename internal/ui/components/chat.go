@@ -60,9 +60,10 @@ type Step struct {
 // Message is one chat entry. Assistant messages carry ordered Steps
 // (thinking, read file, thinking, ...) and Text holds the final answer.
 type Message struct {
-	Role  Role
-	Text  string
-	Steps []Step
+	Role    Role
+	Text    string
+	Steps   []Step
+	Stopped bool // the user pressed esc mid-reply; a STOPPED marker follows it
 }
 
 // liveStep is a step of the reply currently being streamed.
@@ -164,6 +165,62 @@ func (c ChatModel) cloneSteps() []liveStep {
 	steps := make([]liveStep, len(c.live.steps))
 	copy(steps, c.live.steps)
 	return steps
+}
+
+// Stop cuts the running reply short (esc). Whatever is already on screen is
+// kept as a normal message and flagged Stopped, so the chat ends it with a
+// STOPPED marker. Text that was queued but not yet typed is dropped.
+func (c ChatModel) Stop() ChatModel {
+	if !c.active {
+		return c
+	}
+	l := c.live
+	msg := Message{Role: RoleAssistant, Stopped: true}
+	cut := firstUnfinished(l.steps) // the step that was in progress, or -1
+	for i, s := range l.steps {
+		if cut >= 0 && i > cut {
+			break // never shown yet
+		}
+		if i == cut {
+			switch s.kind {
+			case StepThinking:
+				n := min(s.shown, len(s.think))
+				if n == 0 {
+					continue // nothing was typed, so there is nothing to keep
+				}
+				s.think = s.think[:n]
+				s.hidden = false // keep the cut-off thought visible
+			case StepShell:
+				s.out = s.out[:min(s.shown, len(s.out))]
+			case StepEdit:
+				s.diff = s.diff[:min(s.shown, len(s.diff))]
+			}
+		}
+		msg.Steps = append(msg.Steps, s.toStep())
+	}
+	if cut < 0 {
+		msg.Text = string(l.answer[:min(l.answerShown, len(l.answer))])
+	}
+	c.messages = append(c.messages, msg)
+	c.active = false
+	c.live = liveReply{}
+	c.hovering = false
+	c.offset = 0
+	return c
+}
+
+// stoppedLine is the "---- STOPPED ----" marker, centred in cw cells.
+func stoppedLine(cw int) string {
+	const label = " STOPPED "
+	w := cw - 2
+	dashes := w - len(label)
+	if dashes < 4 {
+		dashes = 4
+	}
+	left := dashes / 2
+	return " " + LineStyle.Render(strings.Repeat("-", left)) +
+		ErrorStyle.Bold(true).Render(label) +
+		LineStyle.Render(strings.Repeat("-", dashes-left))
 }
 
 // StartReply begins a new streamed reply. A thinking step starts spinning
@@ -446,6 +503,10 @@ func (c ChatModel) lines() []row {
 			if m.Text != "" {
 				out = append(out, blank...)
 				out = append(out, plainRows(answerLines(m.Text, cw))...)
+			}
+			if m.Stopped {
+				out = append(out, blank...)
+				out = append(out, plainRows([]string{stoppedLine(cw)})...)
 			}
 		case RoleError:
 			out = append(out, plainRows([]string{ErrorStyle.Render(" ✖ error")})...)

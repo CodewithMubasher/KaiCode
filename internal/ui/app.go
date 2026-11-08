@@ -19,6 +19,10 @@ const contextWindow = 256_000
 // sidebarMinTerm is the terminal width below which the sidebar hides itself.
 const sidebarMinTerm = 100
 
+// dialogDim is how much of its brightness the page keeps while the command
+// menu is open (0.5 = 50% opacity).
+const dialogDim = 0.5
+
 const (
 minW = 60
 minH = 14
@@ -158,6 +162,9 @@ m.input, _ = m.input.Update(tea.PasteMsg{Content: msg.Content})
 return m.layout(), nil
 
 case tea.MouseMotionMsg:
+if m.dialog.Visible() { // the page behind the modal is inert
+return m, nil
+}
 m.chat = m.chat.Hover(msg.X, msg.Y)
 if m.sideW > 0 {
 m.sidebar = m.sidebar.Hover(msg.X-m.mainW, msg.Y)
@@ -165,12 +172,24 @@ m.sidebar = m.sidebar.Hover(msg.X-m.mainW, msg.Y)
 return m, nil
 
 case tea.MouseClickMsg:
+if m.dialog.Visible() {
+return m, nil
+}
 if msg.Button == tea.MouseLeft {
 m.chat = m.chat.Click(msg.X, msg.Y)
 }
 return m, nil
 
 case tea.MouseWheelMsg:
+if m.dialog.Visible() { // wheel scrolls the command list, not the chat
+switch msg.Button {
+case tea.MouseWheelUp:
+m.dialog = m.dialog.Scroll(-1)
+case tea.MouseWheelDown:
+m.dialog = m.dialog.Scroll(1)
+}
+return m, nil
+}
 switch msg.Button {
 case tea.MouseWheelUp:
 m.chat = m.chat.ScrollUp(3)
@@ -218,6 +237,11 @@ return m, nil
 }
 switch msg.String() {
 case "ctrl+c", "esc":
+if msg.String() == "esc" && m.chat.Active() { // esc stops a running reply
+m.chat = m.chat.Stop()
+m.state, m.fake = StateIdle, nil
+return m.layout(), nil
+}
 if m.input.Value() == "" {
 return m, tea.Quit
 }
@@ -322,7 +346,8 @@ content = mainCol
 if m.dialog.Visible() && m.width >= minW && m.height >= minH {
 bw, bh := m.dialog.Size()
 top := (m.height - bh) / 2
-content = components.OverlayString(content, m.dialog.View(), (m.width-bw)/2, top+bh)
+// everything behind the modal is shown at 50% opacity
+content = components.OverlayModal(content, dialogDim, m.dialog.View(), (m.width-bw)/2, top+bh)
 }
 
 v := tea.NewView(content)

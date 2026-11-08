@@ -35,6 +35,13 @@ func DefaultDialogItems() []DialogItem {
 	}
 }
 
+const (
+	dialogPadX      = 3 // blank cells between the box edge and its content
+	dialogPadTop    = 2 // blank rows above the title
+	dialogPadBottom = 3 // blank rows below the list
+	dialogListRows  = 9 // list lines visible at once; the rest scrolls
+)
+
 // DialogResult tells the app what a key press did to the dialog.
 type DialogResult int
 
@@ -82,13 +89,30 @@ func (d DialogModel) SetSize(termW, termH int) DialogModel {
 	if d.w < 30 {
 		d.w = 30
 	}
-	maxH := termH - 2
-	if maxH > 24 {
-		maxH = 24
+	// fixed rows: top pad, title, blank, search, blank, (list), bottom pad
+	chrome := dialogPadTop + 4 + dialogPadBottom
+	d.listH = dialogListRows
+	if max := termH - 2 - chrome; d.listH > max {
+		d.listH = max
 	}
-	d.listH = maxH - 6 // blank, title, blank, search, blank, ..., blank
 	if d.listH < 3 {
 		d.listH = 3
+	}
+	return d.clamp()
+}
+
+// Scroll moves the selection by delta rows (used by the mouse wheel).
+func (d DialogModel) Scroll(delta int) DialogModel {
+	n := len(d.matches)
+	if n == 0 {
+		return d
+	}
+	d.sel += delta
+	if d.sel < 0 {
+		d.sel = 0
+	}
+	if d.sel > n-1 {
+		d.sel = n - 1
 	}
 	return d.clamp()
 }
@@ -248,7 +272,7 @@ func (d DialogModel) Size() (w, h int) {
 	if rows == 0 {
 		rows = 1
 	}
-	return d.w, rows + 6
+	return d.w, rows + 4 + dialogPadTop + dialogPadBottom
 }
 
 // View renders the box: one string per row, all d.w cells wide.
@@ -260,15 +284,26 @@ func (d DialogModel) View() []string {
 	bg := lipgloss.NewStyle().Background(ColPanel)
 	text := bg.Foreground(ColText)
 	muted := bg.Foreground(ColMuted)
-	pad := bg.Render("  ")
-	inner := pw - 4
+	pad := bg.Render(spaces(dialogPadX))
+	inner := pw - 2*dialogPadX
 	blank := bg.Render(spaces(pw))
 
-	// title row: "Commands" ........ "esc"
+	ls := d.lines()
+	end := d.offset + d.listH
+	if end > len(ls) {
+		end = len(ls)
+	}
+	start := min(d.offset, len(ls))
+
+	// top padding, then title row: "Commands" ........ "esc"
+	var rows []string
+	for i := 0; i < dialogPadTop; i++ {
+		rows = append(rows, blank)
+	}
 	title := text.Bold(true).Render("Commands")
 	esc := muted.Render("esc")
 	gap := bg.Render(spaces(inner - lipgloss.Width("Commands") - lipgloss.Width("esc")))
-	rows := []string{blank, pad + title + gap + esc + pad, blank}
+	rows = append(rows, pad+title+gap+esc+pad, blank)
 
 	// search row
 	cur := text.Reverse(true)
@@ -282,15 +317,10 @@ func (d DialogModel) View() []string {
 	rows = append(rows, pad+padStyled(search, inner, bg)+pad, blank)
 
 	// list
-	ls := d.lines()
-	end := d.offset + d.listH
-	if end > len(ls) {
-		end = len(ls)
-	}
 	if len(ls) == 0 {
 		rows = append(rows, pad+padStyled(muted.Render("No results"), inner, bg)+pad)
 	}
-	for _, l := range ls[min(d.offset, len(ls)):end] {
+	for _, l := range ls[start:end] {
 		switch {
 		case l.item == -2:
 			rows = append(rows, blank)
@@ -300,12 +330,17 @@ func (d DialogModel) View() []string {
 			rows = append(rows, d.itemRow(d.items[d.matches[l.item]], l.item == d.sel, pw))
 		}
 	}
-	return append(rows, blank)
+
+	// bottom padding
+	for i := 0; i < dialogPadBottom; i++ {
+		rows = append(rows, blank)
+	}
+	return rows
 }
 
 // itemRow renders "  Title            key  ", highlighted in teal if selected.
 func (d DialogModel) itemRow(it DialogItem, selected bool, pw int) string {
-	region := pw - 2 // one cell of margin on each side of the highlight
+	region := pw - 2*(dialogPadX-1) // highlight bar, inset so its text lines up with the headings
 	keyW := lipgloss.Width(it.Key)
 	titleW := region - 2 - keyW
 	if keyW > 0 {
@@ -319,7 +354,7 @@ func (d DialogModel) itemRow(it DialogItem, selected bool, pw int) string {
 		kst = lipgloss.NewStyle().Background(ColTeal).Foreground(ColOnTeal)
 	}
 	body := st.Render(" "+padRight(title, titleW+boolInt(keyW > 0))) + kst.Render(it.Key) + st.Render(" ")
-	edge := lipgloss.NewStyle().Background(ColPanel).Render(" ")
+	edge := lipgloss.NewStyle().Background(ColPanel).Render(spaces(dialogPadX - 1))
 	return edge + body + edge
 }
 
