@@ -15,6 +15,9 @@ import (
 	"kai/internal/tools"
 )
 
+// progressEvery is the longest a growing line count waits before it is shown.
+const progressEvery = 60 * time.Millisecond
+
 // Config sets up an Agent.
 type Config struct {
 	Provider    Provider
@@ -29,9 +32,11 @@ type Config struct {
 
 // Entry is one item of Kai's own record of the conversation (context #2).
 type Entry struct {
-	Role string    `json:"role"` // "user", "assistant" or "tool"
-	Text string    `json:"text"`
-	At   time.Time `json:"at"`
+	Role   string    `json:"role"`
+	Text   string    `json:"text"`
+	Steps  string    `json:"steps,omitempty"`
+	Tokens int       `json:"tokens,omitempty"`
+	At     time.Time `json:"at"`
 }
 
 // Agent runs requests against a provider. It keeps the chat's position so
@@ -94,8 +99,8 @@ func (a *Agent) History() []Entry {
 	return append([]Entry(nil), a.history...)
 }
 
-func (a *Agent) record(role, text string) {
-	e := Entry{Role: role, Text: text, At: time.Now()}
+func (a *Agent) record(role, text, steps string) {
+	e := Entry{Role: role, Text: text, Steps: steps, At: time.Now()}
 	a.mu.Lock()
 	a.history = append(a.history, e)
 	a.mu.Unlock()
@@ -205,7 +210,7 @@ func (a *Agent) restartChat() {
 }
 
 func (a *Agent) loop(ctx context.Context, user string, emit func(Event) bool) {
-	a.record("user", user)
+	a.record("user", user, "")
 	body := user // what to say next, without Kai's instructions
 	repairs := 0
 	recovered := false
@@ -227,7 +232,7 @@ func (a *Agent) loop(ctx context.Context, user string, emit func(Event) bool) {
 			return
 		}
 		if res.text != "" {
-			a.record("assistant", res.text)
+			a.record("assistant", res.text, "")
 		}
 
 		if len(res.calls) == 0 {
@@ -257,7 +262,7 @@ func (a *Agent) loop(ctx context.Context, user string, emit func(Event) bool) {
 			if !emit(Event{Kind: EvToolResult, Call: &c, Result: &r}) {
 				return
 			}
-			a.record("tool", r.Output)
+			a.record("tool", r.Output, "")
 			results = append(results, r)
 		}
 		body = dsml.EncodeResults(results)
@@ -316,6 +321,8 @@ func (a *Agent) turn(ctx context.Context, prompt string, emit func(Event) bool) 
 	p := dsml.NewParser()
 	ended := false
 	var prog *ToolProgress // last progress reported for the call being written
+	var progAt time.Time   // when it was reported
+	var seen *ToolProgress // newest progress computed, reported or not
 
 read:
 	for {
@@ -343,9 +350,19 @@ read:
 				usage(false)
 				if tp, ok := p.Progress(); ok && tp.Name == "edit_file" {
 					hp := &ToolProgress{Name: tp.Name, Path: tp.Path, Lines: tp.Lines, Creating: tp.Creating}
-					if prog == nil || *prog != *hp {
-						prog = hp
-						emit(Event{Kind: EvToolProgress, Progress: hp})
+					// A new file or a change of kind is reported at once; a
+					// growing line count at most every progressEvery, so a
+					// long file does not flood the UI with events.
+					seen = hp
+					changed := prog == nil || prog.Name != hp.Name || prog.Path != hp.Path || prog.Creating != hp.Creating
+					// Growth of an eighth also counts, so a short file still
+					// shows its count climbing even on a very fast stream.
+					grew := !changed && hp.Lines-prog.Lines >= 1+prog.Lines/8
+					if changed || grew || (prog.Lines != hp.Lines && time.Since(progAt) >= progressEvery) {
+						prog, progAt = hp, time.Now()
+						if !emit(Event{Kind: EvToolProgress, Progress: hp}) {
+							return res, ctx.Err()
+						}
 					}
 				}
 				if !show(visible) {
@@ -367,6 +384,10 @@ read:
 		}
 	}
 	usage(true)
+	// The count the throttle held back is the final one: show it.
+	if seen != nil && (prog == nil || *seen != *prog) {
+		emit(Event{Kind: EvToolProgress, Progress: seen})
+	}
 
 	if !ended {
 		return res, errors.New("the reply stream closed before the reply was finished")

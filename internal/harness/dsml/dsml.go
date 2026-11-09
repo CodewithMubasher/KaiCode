@@ -62,7 +62,7 @@ func parseInvokes(body string, nextID func() string) ([]tools.Call, []string) {
 	for _, m := range invokeRe.FindAllStringSubmatch(body, -1) {
 		args := map[string]any{}
 		for _, pm := range paramRe.FindAllStringSubmatch(m[2], -1) {
-			name, kind, val := pm[1], pm[2], pm[3]
+			name, kind, val := strings.Clone(pm[1]), pm[2], strings.Clone(pm[3])
 			if kind == "false" {
 				var v any
 				if err := json.Unmarshal([]byte(strings.TrimSpace(val)), &v); err == nil {
@@ -73,7 +73,7 @@ func parseInvokes(body string, nextID func() string) ([]tools.Call, []string) {
 			}
 			args[name] = val
 		}
-		calls = append(calls, tools.Call{ID: nextID(), Name: m[1], Args: args})
+		calls = append(calls, tools.Call{ID: nextID(), Name: strings.Clone(m[1]), Args: args})
 	}
 	return calls, warns
 }

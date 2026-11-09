@@ -96,11 +96,35 @@ var (
 	mdCode    = lipgloss.NewStyle().Foreground(ColMuted).Background(ColPanel)
 )
 
+// mdState is what carries over from one markdown line to the next. Rendering
+// is otherwise line-by-line, which is what lets a streamed answer be rendered
+// incrementally instead of from scratch on every token.
+type mdState struct {
+	inCode    bool
+	prevBlank bool
+}
+
+func newMdState() mdState { return mdState{prevBlank: true} }
+
 // renderMarkdown renders a small markdown subset (headings, bullets,
 // numbered lists, **bold**, `code`, fenced code) as lines at most w wide.
 func renderMarkdown(text string, w int) []string {
+	out, _ := renderMarkdownState(text, w, newMdState())
+	for len(out) > 0 && out[len(out)-1] == "" {
+		out = out[:len(out)-1]
+	}
+	return out
+}
+
+// renderMarkdownState renders text starting from state st and returns the
+// rows plus the state after the last line. Trailing blank rows are kept so
+// that rendering a text in pieces gives exactly the rows of rendering it whole.
+func renderMarkdownState(text string, w int, st mdState) ([]string, mdState) {
+	if w < 1 {
+		w = 1
+	}
 	var out []string
-	inCode, prevBlank := false, true
+	inCode, prevBlank := st.inCode, st.prevBlank
 	for _, raw := range strings.Split(text, "\n") {
 		line := strings.TrimRight(raw, " \r")
 		trim := strings.TrimLeft(line, " ")
@@ -127,11 +151,11 @@ func renderMarkdown(text string, w int) []string {
 		switch {
 		case strings.HasPrefix(trim, "# "), strings.HasPrefix(trim, "## "), strings.HasPrefix(trim, "### "):
 			h := strings.TrimLeft(trim, "# ")
-			st := mdHeading
+			hs := mdHeading
 			if strings.HasPrefix(trim, "### ") {
-				st = TextStyle.Bold(true)
+				hs = TextStyle.Bold(true)
 			}
-			out = append(out, wrapSpans(parseInline(h, st), "", "", w)...)
+			out = append(out, wrapSpans(parseInline(h, hs), "", "", w)...)
 		case strings.HasPrefix(trim, "- "), strings.HasPrefix(trim, "* "):
 			first := spaces(indent) + AccentStyle.Render("•") + " "
 			out = append(out, wrapSpans(parseInline(trim[2:], TextStyle), first, spaces(indent+2), w)...)
@@ -144,10 +168,7 @@ func renderMarkdown(text string, w int) []string {
 			}
 		}
 	}
-	for len(out) > 0 && out[len(out)-1] == "" {
-		out = out[:len(out)-1]
-	}
-	return out
+	return out, mdState{inCode: inCode, prevBlank: prevBlank}
 }
 
 // numberedItem matches "12. text".

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"unicode/utf8"
+	"unsafe"
 
 	"kai/internal/tools"
 )
@@ -12,18 +13,29 @@ import (
 // back the text that is safe to show, holds back anything that might be the
 // start of a tool-call marker, and collects the calls it finds.
 type Parser struct {
+	// raw holds the unread reply. It is append-only (bytes already in it are
+	// never overwritten), so buf can be a zero-copy string view of it: adding
+	// a chunk is amortised O(chunk) instead of copying the whole buffer, which
+	// made a long file quadratic.
+	raw     []byte
 	buf     string
 	inCalls bool
 	calls   []tools.Call
 	warns   []string
 	seq     int
+
+	// closeScan is how much of buf was already searched for the closing
+	// wrapper tag. It keeps a long tool call (a big file) linear: each chunk
+	// only scans the new bytes instead of the whole buffer again.
+	closeScan int
+	pr        progressState
 }
 
 func NewParser() *Parser { return &Parser{} }
 
 // Feed adds a chunk and returns the visible text it releases.
 func (p *Parser) Feed(chunk string) string {
-	p.buf += chunk
+	p.push(chunk)
 	return p.drain(false)
 }
 
@@ -52,36 +64,14 @@ type ToolProgress struct {
 // Progress returns the call currently being written, if one is open. It is
 // only meaningful while the reply is streaming: once the invoke is closed the
 // call is complete and reported through Calls.
+//
+// It is called for every chunk, so it works incrementally (see progressState)
+// and costs time proportional to the new bytes, not to the file so far.
 func (p *Parser) Progress() (ToolProgress, bool) {
 	if !p.inCalls {
 		return ToolProgress{}, false
 	}
-	locs := invokeOpenRe.FindAllStringSubmatchIndex(p.buf, -1)
-	if len(locs) == 0 {
-		return ToolProgress{}, false
-	}
-	last := locs[len(locs)-1]
-	body := p.buf[last[1]:]
-	if invokeCloseRe.MatchString(body) {
-		return ToolProgress{}, false // the last call is complete
-	}
-
-	prog := ToolProgress{Name: p.buf[last[2]:last[3]], Creating: true}
-	if v, closed, ok := partialParam(body, "path"); ok && closed {
-		prog.Path = strings.TrimSpace(v)
-	}
-	if v, _, ok := partialParam(body, "new_string"); ok {
-		prog.Lines = lineCount(v)
-	} else if v, _, ok := partialParam(body, "content"); ok {
-		prog.Lines = lineCount(v)
-	}
-	if old, _, ok := partialParam(body, "old_string"); ok {
-		prog.Creating = strings.TrimSpace(old) == ""
-	}
-	if prog.Name == "" || prog.Path == "" {
-		return ToolProgress{}, false
-	}
-	return prog, true
+	return p.pr.update(p.buf)
 }
 
 // partialParam returns the value of a parameter inside body and whether its
@@ -126,25 +116,29 @@ func (p *Parser) drain(final bool) string {
 	var out strings.Builder
 	for {
 		if p.inCalls {
-			loc := closeRe.FindStringIndex(p.buf)
+			loc := p.findClose()
 			if loc == nil {
 				if final {
 					p.addCalls(p.buf)
 					p.warns = append(p.warns, "tool_calls block was never closed (the reply ended early)")
-					p.buf, p.inCalls = "", false
+					p.drop(len(p.buf))
+					p.inCalls = false
+					p.resetScan()
 				}
 				break
 			}
 			p.addCalls(p.buf[:loc[0]])
-			p.buf = p.buf[loc[1]:]
+			p.drop(loc[1])
 			p.inCalls = false
+			p.resetScan()
 			continue
 		}
 
 		if loc := openRe.FindStringIndex(p.buf); loc != nil {
 			out.WriteString(clean(p.buf[:loc[0]]))
-			p.buf = p.buf[loc[1]:]
+			p.drop(loc[1])
 			p.inCalls = true
+			p.resetScan()
 			continue
 		}
 
@@ -152,8 +146,9 @@ func (p *Parser) drain(final bool) string {
 		// and runs to the end of the reply.
 		if loc := bareInvokeRe.FindStringIndex(p.buf); loc != nil {
 			out.WriteString(clean(p.buf[:loc[0]]))
-			p.buf = p.buf[loc[0]:]
+			p.drop(loc[0])
 			p.inCalls = true
+			p.resetScan()
 			continue
 		}
 
@@ -165,7 +160,7 @@ func (p *Parser) drain(final bool) string {
 		}
 		cut := len(p.buf) - keep
 		out.WriteString(clean(p.buf[:cut]))
-		p.buf = p.buf[cut:]
+		p.drop(cut)
 		break
 	}
 	return out.String()
@@ -201,4 +196,60 @@ func Parse(text string) (visible string, calls []tools.Call, warnings []string) 
 	visible = p.Feed(text)
 	visible += p.Finish()
 	return visible, p.Calls(), p.Warnings()
+}
+
+// scanBackoff is how far a search restarts before the already-scanned point:
+// a tag can arrive split across two chunks, and the longest one we look for
+// is well under this.
+const scanBackoff = 192
+
+// resetScan forgets incremental state; call it whenever buf is re-sliced or
+// the parser enters or leaves a tool_calls block.
+func (p *Parser) resetScan() {
+	p.closeScan = 0
+	p.pr = progressState{}
+}
+
+// findClose looks for the closing wrapper tag, scanning only what has not
+// been scanned before (plus a small overlap).
+func (p *Parser) findClose() []int {
+	from := p.closeScan - scanBackoff
+	if from < 0 {
+		from = 0
+	}
+	loc := closeRe.FindStringIndex(p.buf[from:])
+	if loc == nil {
+		p.closeScan = len(p.buf)
+		return nil
+	}
+	return []int{loc[0] + from, loc[1] + from}
+}
+
+// push appends a chunk to the buffer.
+func (p *Parser) push(chunk string) {
+	if chunk == "" {
+		return
+	}
+	p.raw = append(p.raw, chunk...)
+	p.view()
+}
+
+// drop discards the first n bytes of the buffer.
+func (p *Parser) drop(n int) {
+	if n >= len(p.raw) {
+		p.raw = nil
+	} else {
+		p.raw = p.raw[n:]
+	}
+	p.view()
+}
+
+// view points buf at raw without copying. Strings taken from buf stay valid
+// because raw is never written to except by appending past its end.
+func (p *Parser) view() {
+	if len(p.raw) == 0 {
+		p.buf = ""
+		return
+	}
+	p.buf = unsafe.String(&p.raw[0], len(p.raw))
 }

@@ -2,8 +2,10 @@ package components
 
 import (
 	"image/color"
+	"strings"
 
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // cardBar is the left bar of shell and edit cards: the same "▍" the input
@@ -22,19 +24,30 @@ func withBar(rows []string, bg color.Color) []string {
 	return out
 }
 
-// hardWrap splits s into chunks of at most w cells, keeping indentation.
+// hardWrap splits s into chunks of at most w cells (not runes: wide
+// characters take two), so no chunk can overflow its card.
 func hardWrap(s string, w int) []string {
 	if w < 1 {
 		w = 1
 	}
-	rs := []rune(s)
-	if len(rs) == 0 {
+	if s == "" {
 		return []string{""}
 	}
 	var out []string
-	for len(rs) > w {
-		out = append(out, string(rs[:w]))
-		rs = rs[w:]
+	var cur strings.Builder
+	curW := 0
+	for _, r := range s {
+		rw := 1
+		if r >= 0x1100 || r < 0x20 {
+			rw = ansi.StringWidth(string(r))
+		}
+		if curW+rw > w && curW > 0 {
+			out = append(out, cur.String())
+			cur.Reset()
+			curW = 0
+		}
+		cur.WriteRune(r)
+		curW += rw
 	}
-	return append(out, string(rs))
+	return append(out, cur.String())
 }

@@ -1,4 +1,4 @@
-package bridge
+﻿package bridge
 
 import (
 	"context"
@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -191,6 +192,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/event", s.guard(s.handleEvent))
 	mux.HandleFunc("POST /v1/log", s.guard(s.handleLog))
 	mux.HandleFunc("GET /v1/status", s.guard(s.handleStatus))
+mux.HandleFunc("POST /_sync", s.handleSync)
 	return mux
 }
 
@@ -483,4 +485,22 @@ func randomHex(n int) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
+var auth map[string]any
+if err := json.NewDecoder(r.Body).Decode(&auth); err != nil {
+http.Error(w, "bad sync body", http.StatusBadRequest)
+return
+}
+
+// Write the synced credentials to ds_auth.json
+b, _ := json.MarshalIndent(auth, "", " ")
+if err := os.WriteFile("ds_auth.json", b, 0600); err != nil {
+s.log.Error("could not write ds_auth.json", "err", err)
+http.Error(w, "could not save credentials", http.StatusInternalServerError)
+return
+}
+s.log.Info("synced DeepSeek credentials from extension")
+w.WriteHeader(http.StatusOK)
 }

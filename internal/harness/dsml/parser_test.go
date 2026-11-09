@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"kai/internal/tools"
 )
@@ -315,5 +316,103 @@ func TestProgressTellsEditFromCreate(t *testing.T) {
 	}
 	if prog.Lines != 2 {
 		t.Errorf("lines = %d, want 2", prog.Lines)
+	}
+}
+
+// Feeding a reply one byte at a time must give the same progress and calls as
+// feeding it whole: tags split across chunks are the usual way incremental
+// scanners go wrong.
+func TestProgressSurvivesTagsSplitAcrossChunks(t *testing.T) {
+	reply := "Hi.\n<|DSML|tool_calls>\n<|DSML|invoke name=\"edit_file\">\n" +
+		"<|DSML|parameter name=\"path\" string=\"true\">a/b.go</|DSML|parameter>\n" +
+		"<|DSML|parameter name=\"old_string\" string=\"true\"></|DSML|parameter>\n" +
+		"<|DSML|parameter name=\"new_string\" string=\"true\">one\ntwo\nthree\n</|DSML|parameter>\n" +
+		"</|DSML|invoke>\n</|DSML|tool_calls>"
+
+	for _, size := range []int{1, 2, 3, 5, 7, 64} {
+		p := NewParser()
+		var vis strings.Builder
+		var last ToolProgress
+		sawLines := 0
+		for i := 0; i < len(reply); i += size {
+			end := i + size
+			if end > len(reply) {
+				end = len(reply)
+			}
+			vis.WriteString(p.Feed(reply[i:end]))
+			if pr, ok := p.Progress(); ok {
+				last = pr
+				if pr.Lines < sawLines {
+					t.Fatalf("size %d: line count went backwards: %d -> %d", size, sawLines, pr.Lines)
+				}
+				sawLines = pr.Lines
+			}
+		}
+		vis.WriteString(p.Finish())
+		if strings.TrimSpace(vis.String()) != "Hi." {
+			t.Errorf("size %d: visible = %q", size, vis.String())
+		}
+		if last.Name != "edit_file" || last.Path != "a/b.go" || !last.Creating {
+			t.Errorf("size %d: last progress = %+v", size, last)
+		}
+		if sawLines < 3 {
+			t.Errorf("size %d: lines reached only %d", size, sawLines)
+		}
+		calls := p.Calls()
+		if len(calls) != 1 || calls[0].Args["path"] != "a/b.go" || calls[0].Args["new_string"] != "one\ntwo\nthree\n" {
+			t.Errorf("size %d: calls = %+v", size, calls)
+		}
+		if _, ok := p.Progress(); ok {
+			t.Errorf("size %d: progress still reported after the call completed", size)
+		}
+	}
+}
+
+// Two calls in one block: progress must follow the second.
+func TestProgressFollowsTheLatestInvoke(t *testing.T) {
+	p := NewParser()
+	p.Feed("<|DSML|tool_calls>\n<|DSML|invoke name=\"edit_file\">\n" +
+		"<|DSML|parameter name=\"path\" string=\"true\">one.txt</|DSML|parameter>\n" +
+		"<|DSML|parameter name=\"new_string\" string=\"true\">x</|DSML|parameter>\n</|DSML|invoke>\n" +
+		"<|DSML|invoke name=\"edit_file\">\n" +
+		"<|DSML|parameter name=\"path\" string=\"true\">two.txt</|DSML|parameter>\n" +
+		"<|DSML|parameter name=\"new_string\" string=\"true\">a\nb")
+	pr, ok := p.Progress()
+	if !ok || pr.Path != "two.txt" || pr.Lines != 2 {
+		t.Fatalf("progress = %+v ok=%v", pr, ok)
+	}
+}
+
+// A huge file streamed in tiny chunks must stay fast (it used to be
+// quadratic and froze the UI on long files).
+func TestLongFileStreamsInLinearTime(t *testing.T) {
+	body := strings.Repeat("func main() { println(\"hello world\") }\n", 100000) // ~4 MB
+	reply := "<|DSML|tool_calls>\n<|DSML|invoke name=\"edit_file\">\n" +
+		"<|DSML|parameter name=\"path\" string=\"true\">big.go</|DSML|parameter>\n" +
+		"<|DSML|parameter name=\"new_string\" string=\"true\">" + body +
+		"</|DSML|parameter>\n</|DSML|invoke>\n</|DSML|tool_calls>"
+
+	start := time.Now()
+	p := NewParser()
+	lines := 0
+	for i := 0; i < len(reply); i += 24 {
+		end := i + 24
+		if end > len(reply) {
+			end = len(reply)
+		}
+		p.Feed(reply[i:end])
+		if pr, ok := p.Progress(); ok {
+			lines = pr.Lines
+		}
+	}
+	p.Finish()
+	if lines < 100000 {
+		t.Errorf("last line count = %d", lines)
+	}
+	if got := p.Calls(); len(got) != 1 || len(got[0].Args["new_string"].(string)) != len(body) {
+		t.Fatalf("the call was not parsed intact")
+	}
+	if d := time.Since(start); d > 10*time.Second {
+		t.Fatalf("streaming 4 MB took %v; the parser is not linear", d)
 	}
 }

@@ -36,10 +36,10 @@ func TestDemoteAnswerMovesTextIntoAThought(t *testing.T) {
 	c := NewChat(80, 20).StartReply().StreamAnswer("let me look")
 	before := len(c.live.steps)
 	c = c.DemoteAnswer()
-	if len(c.live.answer) != 0 || len(c.live.steps) != before+1 {
-		t.Fatalf("answer = %q, steps = %d (was %d)", string(c.live.answer), len(c.live.steps), before)
+	if c.live.answer.len() != 0 || len(c.live.steps) != before+1 {
+		t.Fatalf("answer = %q, steps = %d (was %d)", c.live.answer.String(), len(c.live.steps), before)
 	}
-	if got := string(c.live.steps[before].think); got != "let me look" {
+	if got := c.live.steps[before].think.String(); got != "let me look" {
 		t.Errorf("demoted text = %q", got)
 	}
 }
