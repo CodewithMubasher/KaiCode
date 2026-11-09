@@ -1,0 +1,194 @@
+﻿package ui
+
+import (
+"fmt"
+"strings"
+"time"
+
+tea "charm.land/bubbletea/v2"
+"charm.land/lipgloss/v2"
+
+"kai/internal/config"
+"kai/internal/ui/components"
+)
+
+const (
+minW = 60
+minH = 14
+)
+
+type AppState int
+
+const (
+StateIdle AppState = iota
+StateThinking
+)
+
+type Model struct {
+width, height int
+mainW, sideW  int
+bodyH         int
+
+chat    components.ChatModel
+input   components.InputModel
+sidebar components.SidebarModel
+
+state AppState
+fake  *fakeStream
+cfg   *config.Config
+ready bool
+}
+
+func NewModel(cfg *config.Config) Model {
+return Model{
+chat:    components.NewChat(80, 20),
+input:   components.NewInput(80),
+sidebar: components.NewSidebar().SetSessionID("78393329910"), // TODO: real session id
+cfg:     cfg,
+state:   StateIdle,
+}
+}
+
+func (m Model) Init() tea.Cmd { return nil }
+
+func tick() tea.Cmd {
+return tea.Tick(30*time.Millisecond, func(time.Time) tea.Msg { return tickMsg{} })
+}
+
+// layout recomputes every component size from the terminal size.
+func (m Model) layout() Model {
+if m.width < minW || m.height < minH {
+return m
+}
+sideW := m.width * 24 / 100
+if sideW < 16 {
+sideW = 16
+}
+mainW := m.width - sideW
+m.mainW, m.sideW = mainW, sideW
+
+m.input = m.input.SetWidth(mainW)
+
+m.bodyH = m.height
+chatH := m.bodyH - m.input.Height() - 1    // 1 gap row under input
+if chatH < 1 {
+chatH = 1
+}
+m.chat = m.chat.SetSize(mainW, chatH)
+m.sidebar = m.sidebar.SetSize(sideW, m.bodyH)
+return m
+}
+
+func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+switch msg := msg.(type) {
+case tea.WindowSizeMsg:
+m.width, m.height = msg.Width, msg.Height
+m.ready = true
+return m.layout(), nil
+
+case tickMsg:
+if !m.chat.Active() {
+m.state = StateIdle
+m.fake = nil
+return m, nil
+}
+if m.fake != nil {
+m.chat = m.fake.step(m.chat)
+}
+m.chat = m.chat.Tick()
+if !m.chat.Active() {
+m.state = StateIdle
+m.fake = nil
+return m, nil
+}
+return m, tick()
+
+case tea.MouseMotionMsg:
+m.chat = m.chat.Hover(msg.X, msg.Y)
+return m, nil
+
+case tea.MouseClickMsg:
+if msg.Button == tea.MouseLeft {
+m.chat = m.chat.Click(msg.X, msg.Y)
+}
+return m, nil
+
+case tea.MouseWheelMsg:
+switch msg.Button {
+case tea.MouseWheelUp:
+m.chat = m.chat.ScrollUp(3)
+case tea.MouseWheelDown:
+m.chat = m.chat.ScrollDown(3)
+}
+return m, nil
+
+case tea.KeyPressMsg:
+switch msg.String() {
+case "ctrl+c", "esc":
+if m.input.Value() == "" {
+return m, tea.Quit
+}
+m.input = m.input.Reset()
+return m.layout(), nil
+
+case "ctrl+l":
+m.chat = m.chat.Clear()
+return m.layout(), nil
+
+case "pgup":
+m.chat = m.chat.ScrollUp(5)
+return m, nil
+case "pgdown":
+m.chat = m.chat.ScrollDown(5)
+return m, nil
+case "up":
+m.chat = m.chat.ScrollUp(1)
+return m, nil
+case "down":
+m.chat = m.chat.ScrollDown(1)
+return m, nil
+
+case "enter":
+text := strings.TrimSpace(m.input.Value())
+if text == "" || m.state == StateThinking {
+return m, nil
+}
+m.chat = m.chat.AppendUser(text).StartReply()
+m.input = m.input.Reset()
+m.state = StateThinking
+m.fake = newFakeStream()
+return m.layout(), tick()
+}
+}
+
+var cmd tea.Cmd
+m.input, cmd = m.input.Update(msg)
+return m.layout(), cmd
+}
+
+func (m Model) View() tea.View {
+if !m.ready {
+return tea.NewView("Initializing...")
+}
+
+var content string
+if m.width < minW || m.height < minH {
+content = fmt.Sprintf("Terminal too small (%dx%d). Need at least %dx%d.",
+m.width, m.height, minW, minH)
+} else {
+gap := strings.Repeat(" ", m.mainW)
+mainCol := lipgloss.JoinVertical(lipgloss.Left,
+m.chat.View(),
+m.input.View(),
+gap,
+)
+content = lipgloss.JoinHorizontal(lipgloss.Top,
+mainCol, m.sidebar.View(),
+)
+}
+
+v := tea.NewView(content)
+v.AltScreen = true
+v.MouseMode = tea.MouseModeAllMotion
+return v
+}
