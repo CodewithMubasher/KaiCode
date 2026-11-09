@@ -10,13 +10,19 @@ tea "charm.land/bubbletea/v2"
 const maxInputRows = 6
 
 type InputModel struct {
-width  int
-value  []rune
-cursor int
+width       int
+value       []rune
+cursor      int
+placeholder string
 }
 
 func NewInput(w int) InputModel {
-return InputModel{width: w}
+return InputModel{width: w, placeholder: "Type a message..."}
+}
+
+func (i InputModel) SetPlaceholder(p string) InputModel {
+i.placeholder = p
+return i
 }
 
 func (i InputModel) SetWidth(w int) InputModel {
@@ -96,7 +102,10 @@ muted := lipgloss.NewStyle().Background(ColPanel).Foreground(ColMuted)
 
 var text string
 if len(i.value) == 0 {
-ph := []rune("Type a message...")
+ph := []rune(i.placeholder)
+if len(ph) == 0 {
+ph = []rune(" ")
+}
 text = cur.Render(string(ph[0])) + muted.Render(string(ph[1:]))
 } else {
 before := string(i.value[:i.cursor])

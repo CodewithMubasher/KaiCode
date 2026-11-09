@@ -10,11 +10,20 @@ tea "charm.land/bubbletea/v2"
 
 "kai/internal/config"
 "kai/internal/ui/components"
+"kai/internal/version"
 )
 
 const (
 minW = 60
 minH = 14
+)
+
+// Screen is which top-level screen is showing.
+type Screen int
+
+const (
+ScreenHome Screen = iota // banner + centered input, until the first message
+ScreenChat
 )
 
 type AppState int
@@ -33,8 +42,9 @@ chat    components.ChatModel
 input   components.InputModel
 sidebar components.SidebarModel
 
-state AppState
-fake  *fakeStream
+screen Screen
+state  AppState
+fake   *fakeStream
 cfg   *config.Config
 ready bool
 }
@@ -42,9 +52,10 @@ ready bool
 func NewModel(cfg *config.Config) Model {
 return Model{
 chat:    components.NewChat(80, 20),
-input:   components.NewInput(80),
+input:   components.NewInput(80).SetPlaceholder("Ask anything"),
 sidebar: components.NewSidebar().SetSessionID("78393329910"), // TODO: real session id
 cfg:     cfg,
+screen:  ScreenHome,
 state:   StateIdle,
 }
 }
@@ -60,6 +71,15 @@ func (m Model) layout() Model {
 if m.width < minW || m.height < minH {
 return m
 }
+if m.screen == ScreenHome {
+inputW := m.width - 4
+if inputW > 64 {
+inputW = 64
+}
+m.input = m.input.SetWidth(inputW + 2*components.Margin)
+return m
+}
+
 sideW := m.width * 24 / 100
 if sideW < 16 {
 sideW = 16
@@ -153,8 +173,9 @@ text := strings.TrimSpace(m.input.Value())
 if text == "" || m.state == StateThinking {
 return m, nil
 }
+m.screen = ScreenChat
 m.chat = m.chat.AppendUser(text).StartReply()
-m.input = m.input.Reset()
+m.input = m.input.Reset().SetPlaceholder("Type a message...")
 m.state = StateThinking
 m.fake = newFakeStream()
 return m.layout(), tick()
@@ -175,6 +196,13 @@ var content string
 if m.width < minW || m.height < minH {
 content = fmt.Sprintf("Terminal too small (%dx%d). Need at least %dx%d.",
 m.width, m.height, minW, minH)
+} else if m.screen == ScreenHome {
+block := lipgloss.JoinVertical(lipgloss.Center,
+components.Banner(version.Version),
+"",
+m.input.View(),
+)
+content = lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Position(0.52), block)
 } else {
 gap := strings.Repeat(" ", m.mainW)
 mainCol := lipgloss.JoinVertical(lipgloss.Left,
@@ -189,6 +217,7 @@ mainCol, m.sidebar.View(),
 
 v := tea.NewView(content)
 v.AltScreen = true
+v.BackgroundColor = components.ColBG
 v.MouseMode = tea.MouseModeAllMotion
 return v
 }

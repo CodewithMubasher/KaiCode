@@ -10,6 +10,7 @@ import (
 const Margin = 2
 
 var (
+ColBG     color.Color = lipgloss.Color("#000000")
 ColAccent color.Color = lipgloss.Color("#b8148c")
 ColPanel  color.Color = lipgloss.Color("#1a1a1a")
 ColSide   color.Color = lipgloss.Color("#1c1c1c")

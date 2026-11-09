@@ -11,7 +11,7 @@ const logoOffset = 2
 // borderRow is the logo row that sits on the frame's top border.
 const borderRow = logoRows / 2
 
-// HeaderModel draws the top of the frame: the ANSI Shadow logo overlapping
+// HeaderModel draws the top of the frame: the compact logo overlapping
 // the top border, plus the version tag.
 type HeaderModel struct {
 mainW, sideW int
