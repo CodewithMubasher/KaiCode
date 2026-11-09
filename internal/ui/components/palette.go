@@ -30,6 +30,8 @@ func DefaultCommands() []Command {
 		{"init", "Generate the system prompt for this folder"},
 		{"model", "Switch web chat model"},
 		{"new", "Start a new session"},
+		{"provider", "Add or switch provider"},
+		{"rename", "Rename this session"},
 	}
 }
 

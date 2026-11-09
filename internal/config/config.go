@@ -11,6 +11,7 @@ type Config struct {
 	UI       UIConfig       `toml:"ui"`
 	Provider ProviderConfig `toml:"provider"`
 	Session  SessionConfig  `toml:"session"`
+	Storage  StorageConfig  `toml:"storage"`
 	Log      LogConfig      `toml:"log"`
 }
 
@@ -31,6 +32,12 @@ type SessionConfig struct {
 	Dir string `toml:"dir"`
 }
 
+// StorageConfig says where the SQLite database lives: custom providers,
+// sessions, messages and settings.
+type StorageConfig struct {
+	Path string `toml:"path"`
+}
+
 type LogConfig struct {
 	Level string `toml:"level"`
 	File  string `toml:"file"`
@@ -48,6 +55,7 @@ func Default() *Config {
 		UI:       UIConfig{Theme: "default", Mouse: false},
 		Provider: ProviderConfig{Name: "deepseek", Addr: "127.0.0.1:8765"},
 		Session:  SessionConfig{Dir: filepath.Join(kaiDir, "sessions")},
+		Storage:  StorageConfig{Path: filepath.Join(kaiDir, "kai.db")},
 		Log:      LogConfig{Level: "debug", File: filepath.Join(kaiDir, "logs.txt")},
 	}
 }
@@ -62,6 +70,9 @@ func Load(path string) (*Config, error) {
 	}
 	if _, err := toml.DecodeFile(path, cfg); err != nil {
 		return nil, err
+	}
+	if cfg.Storage.Path == "" {
+		cfg.Storage.Path = Default().Storage.Path
 	}
 	// Older configs point at logs/kai.log with level "info". Move them to the
 	// single logs.txt with full detail so problems can be analysed.

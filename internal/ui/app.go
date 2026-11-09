@@ -9,18 +9,13 @@ tea "charm.land/bubbletea/v2"
 "charm.land/lipgloss/v2"
 
 "kai/internal/config"
+"kai/internal/store"
 "kai/internal/ui/components"
 "kai/internal/version"
 )
 
-// contextWindow is the model context size the sidebar measures against.
 const contextWindow = 256_000
-
-// sidebarMinTerm is the terminal width below which the sidebar hides itself.
 const sidebarMinTerm = 100
-
-// dialogDim is how much of its brightness the page keeps while the command
-// menu is open (0.5 = 50% opacity).
 const dialogDim = 0.5
 
 const (
@@ -28,11 +23,10 @@ minW = 60
 minH = 14
 )
 
-// Screen is which top-level screen is showing.
 type Screen int
 
 const (
-ScreenHome Screen = iota // banner + centered input, until the first message
+ScreenHome Screen = iota
 ScreenChat
 )
 
@@ -52,29 +46,45 @@ chat    components.ChatModel
 input   components.InputModel
 sidebar components.SidebarModel
 palette components.PaletteModel
-dialog  components.DialogModel // command menu (ctrl+p / ctrl+k)
-run     runState               // the agent and the request in flight
+dialog  components.DialogModel
+run     runState
 
-sidebarOpen bool // ctrl+d
+sidebarOpen bool
 notice      string
 noticeSeq   int
 
 screen Screen
 state  AppState
 fake   *fakeStream
-cfg   *config.Config
-ready bool
+cfg    *config.Config
+ready  bool
+
+st  *store.Store
+ps  *persister
+hub *providerHub
+
+picker     components.DialogModel
+pickerKind pickerKind
+pickerFor  int64
+form       components.FormModel
+formKind   formKind
+formFor    int64
 }
 
-func NewModel(cfg *config.Config) Model {
+func NewModel(cfg *config.Config, st *store.Store) Model {
+ps := newPersister(st, cwdLabel())
+hub := &providerHub{cfg: cfg, st: st}
 return Model{
 chat:    components.NewChat(80, 20),
 input:   components.NewInput(80).SetPlaceholder("Ask anything"),
-sidebar: components.NewSidebar().SetSessionID("78393329910").SetVersion(version.Version).SetCwd(cwdLabel()), // TODO: real session id
+sidebar: components.NewSidebar().SetSessionID("78393329910").SetVersion(version.Version).SetCwd(cwdLabel()),
 palette: components.NewPalette(components.DefaultCommands()),
 dialog:  components.NewDialog(components.DefaultDialogItems()),
 cfg:     cfg,
-run:     newRunState(cfg),
+run:     newRunState(cfg, ps, hub),
+st:      st,
+ps:      ps,
+hub:     hub,
 screen:  ScreenHome,
 sidebarOpen: true,
 state:   StateIdle,
@@ -87,11 +97,11 @@ func tick() tea.Cmd {
 return tea.Tick(30*time.Millisecond, func(time.Time) tea.Msg { return tickMsg{} })
 }
 
-// layout recomputes every component size from the terminal size.
 func (m Model) layout() Model {
-// the slash-command popup follows whatever is typed in the input
 m.palette = m.palette.Sync(m.input.Value())
 m.dialog = m.dialog.SetSize(m.width, m.height)
+m.picker = m.picker.SetSize(m.width, m.height)
+m.form = m.form.SetSize(m.width, m.height)
 if m.width < minW || m.height < minH {
 return m
 }
@@ -100,7 +110,6 @@ inputW := m.width - 4
 if inputW > 64 {
 inputW = 64
 }
-// the popup may cover the banner and the gap above the input
 m.palette = m.palette.SetRows(lipgloss.Height(components.Banner(version.Version)) + 1)
 m.input = m.input.SetWidth(inputW + 2*components.Margin)
 return m
@@ -115,11 +124,9 @@ sideW = 16
 }
 mainW := m.width - sideW
 m.mainW, m.sideW = mainW, sideW
-
 m.input = m.input.SetWidth(mainW)
-
 m.bodyH = m.height
-chatH := m.bodyH - m.input.Height() - 1    // 1 gap row under input
+chatH := m.bodyH - m.input.Height() - 1
 if chatH < 1 {
 chatH = 1
 }
@@ -153,8 +160,24 @@ return m, nil
 }
 return m, tick()
 
+case modelsMsg:
+nm, cmd := m.onModels(msg)
+return nm.layout(), cmd
+
+case tea.PasteMsg:
+if m.form.Visible() {
+m.form = m.form.Paste(msg.Content)
+return m, nil
+}
+if m.modalOpen() {
+return m, nil
+}
+var pcmd tea.Cmd
+m.input, pcmd = m.input.Update(msg)
+return m.layout(), pcmd
+
 case agentMsg:
-if msg.id != m.run.id { // from a request that was stopped
+if msg.id != m.run.id {
 return m, nil
 }
 m = m.applyEvent(msg.ev)
@@ -169,12 +192,16 @@ m.notice = ""
 }
 return m, nil
 
-case tea.ClipboardMsg: // answer to an OSC 52 read, treated as a paste
+case tea.ClipboardMsg:
+if m.form.Visible() {
+m.form = m.form.Paste(msg.Content)
+return m, nil
+}
 m.input, _ = m.input.Update(tea.PasteMsg{Content: msg.Content})
 return m.layout(), nil
 
 case tea.MouseMotionMsg:
-if m.dialog.Visible() { // the page behind the modal is inert
+if m.modalOpen() {
 return m, nil
 }
 m.chat = m.chat.Hover(msg.X, msg.Y)
@@ -184,7 +211,7 @@ m.sidebar = m.sidebar.Hover(msg.X-m.mainW, msg.Y)
 return m, nil
 
 case tea.MouseClickMsg:
-if m.dialog.Visible() {
+if m.modalOpen() {
 return m, nil
 }
 if msg.Button == tea.MouseLeft {
@@ -193,7 +220,19 @@ m.chat = m.chat.Click(msg.X, msg.Y)
 return m, nil
 
 case tea.MouseWheelMsg:
-if m.dialog.Visible() { // wheel scrolls the command list, not the chat
+if m.form.Visible() {
+return m, nil
+}
+if m.picker.Visible() {
+switch msg.Button {
+case tea.MouseWheelUp:
+m.picker = m.picker.Scroll(-1)
+case tea.MouseWheelDown:
+m.picker = m.picker.Scroll(1)
+}
+return m, nil
+}
+if m.dialog.Visible() {
 switch msg.Button {
 case tea.MouseWheelUp:
 m.dialog = m.dialog.Scroll(-1)
@@ -211,7 +250,34 @@ m.chat = m.chat.ScrollDown(3)
 return m, nil
 
 case tea.KeyPressMsg:
-if m.dialog.Visible() { // modal: it owns the keyboard while open
+if m.form.Visible() {
+if msg.String() == "ctrl+v" {
+return m, pasteCmd()
+}
+var fres components.FormResult
+m.form, fres = m.form.Update(msg)
+switch fres {
+case components.FormSubmitted:
+nm, cmd := m.submitForm()
+return nm.layout(), cmd
+case components.FormCancelled:
+nm, cmd := m.cancelForm()
+return nm.layout(), cmd
+}
+return m, nil
+}
+if m.picker.Visible() {
+var pres components.DialogResult
+m.picker, pres = m.picker.Update(msg)
+if pres == components.DialogChose {
+if it, ok := m.picker.Selected(); ok {
+nm, cmd := m.pickerChose(it)
+return nm.layout(), cmd
+}
+}
+return m, nil
+}
+if m.dialog.Visible() {
 var res components.DialogResult
 m.dialog, res = m.dialog.Update(msg)
 if res == components.DialogChose {
@@ -249,7 +315,7 @@ return m, nil
 }
 switch msg.String() {
 case "ctrl+c", "esc":
-if msg.String() == "esc" && m.chat.Active() { // esc stops a running reply
+if msg.String() == "esc" && m.chat.Active() {
 m = m.stopRun()
 m.chat = m.chat.Stop()
 m.state, m.fake = StateIdle, nil
@@ -333,8 +399,7 @@ components.Banner(version.Version),
 m.input.View(),
 m.noticeRow(m.input.Width()),
 )
-// slash-command popup sits right above the input
-inputTop := lipgloss.Height(block) - 1 - m.input.Height() // 1 = notice row
+inputTop := lipgloss.Height(block) - 1 - m.input.Height()
 popupX := (lipgloss.Width(block)-m.input.Width())/2 + components.Margin
 block = components.OverlayString(block, m.palette.View(m.input.Width()-2*components.Margin), popupX, inputTop)
 content = lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Position(0.52), block)
@@ -345,23 +410,17 @@ m.chat.View(),
 m.input.View(),
 gap,
 )
-// slash-command popup sits right above the input
 mainCol = components.OverlayString(mainCol, m.palette.View(m.mainW-2*components.Margin), components.Margin, lipgloss.Height(m.chat.View()))
 if m.sideW > 0 {
 content = lipgloss.JoinHorizontal(lipgloss.Top,
-mainCol, m.sidebar.SetContext(m.run.tokens, contextWindow).View(),
+mainCol, m.sidebar.SetContext(m.run.tokens, contextWindow).SetProvider(m.hub.label).View(),
 )
 } else {
 content = mainCol
 }
 }
 
-if m.dialog.Visible() && m.width >= minW && m.height >= minH {
-bw, bh := m.dialog.Size()
-top := (m.height - bh) / 2
-// everything behind the modal is shown at 50% opacity
-content = components.OverlayModal(content, dialogDim, m.dialog.View(), (m.width-bw)/2, top+bh)
-}
+content = m.overlayModal(content)
 
 v := tea.NewView(content)
 v.AltScreen = true

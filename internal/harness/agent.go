@@ -82,7 +82,7 @@ func (a *Agent) Reset(ctx context.Context) {
 	sess := a.session
 	a.mu.Unlock()
 	slog.Info("agent reset: next message opens a new web chat", "session", sess)
-	if s, ok := a.cfg.Provider.(Sessioner); ok {
+	if s, ok := a.provider().(Sessioner); ok {
 		_ = s.NewSession(ctx)
 	}
 }
@@ -278,7 +278,7 @@ func (a *Agent) turn(ctx context.Context, prompt string, emit func(Event) bool) 
 
 	parent, session, newChat := a.chatState()
 	slog.Info("agent turn", "session", session, "newChat", newChat, "hasParent", parent != nil, "promptBytes", len(prompt))
-	stream, err := a.cfg.Provider.Send(ctx, Turn{
+	stream, err := a.provider().Send(ctx, Turn{
 		Prompt:   prompt,
 		ParentID: parent,
 		Thinking: a.cfg.Thinking,
@@ -381,4 +381,46 @@ read:
 		res.problem = strings.Join(p.Warnings(), "; ")
 	}
 	return res, nil
+}
+
+// provider is the provider in use right now (it can change with SetProvider).
+func (a *Agent) provider() Provider {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.cfg.Provider
+}
+
+// SetProvider switches to another provider in the middle of a conversation.
+// Kai's own record of the conversation is kept: the next message opens a fresh
+// chat on the new provider and starts with a recap of it.
+func (a *Agent) SetProvider(p Provider) {
+	a.mu.Lock()
+	a.cfg.Provider = p
+	a.parent, a.started = nil, false
+	a.tokens = 0
+	a.session = newSessionID()
+	a.recap = recap(a.history, recapBudget)
+	sess := a.session
+	a.mu.Unlock()
+	slog.Info("provider switched: next message opens a new chat with a recap", "session", sess)
+	if s, ok := p.(Sessioner); ok {
+		_ = s.NewSession(context.Background())
+	}
+}
+
+// Resume loads a saved conversation. Kai's record becomes the history and the
+// next message opens a fresh chat that starts with a recap of it.
+func (a *Agent) Resume(h []Entry) {
+	a.mu.Lock()
+	a.parent, a.started = nil, false
+	a.tokens = 0
+	a.session = newSessionID()
+	a.history = append([]Entry(nil), h...)
+	a.recap = recap(a.history, recapBudget)
+	sess := a.session
+	a.mu.Unlock()
+	slog.Info("session resumed: next message opens a new chat with a recap", "session", sess, "entries", len(h))
+	if s, ok := a.provider().(Sessioner); ok {
+		_ = s.NewSession(context.Background())
+	}
 }

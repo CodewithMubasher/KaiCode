@@ -13,6 +13,7 @@ import (
 
 	"kai/internal/config"
 	"kai/internal/logging"
+	"kai/internal/store"
 	"kai/internal/ui"
 	"kai/internal/version"
 )
@@ -57,7 +58,17 @@ var rootCmd = &cobra.Command{
 			}
 		}()
 
-		p := tea.NewProgram(ui.NewModel(cfg))
+		// Sessions, chats and custom providers live in one SQLite file. If it
+		// cannot be opened Kai still runs, it just cannot save anything.
+		st, err := store.Open(cfg.Storage.Path)
+		if err != nil {
+			logger.Error("could not open the database: sessions and providers will not be saved", "path", cfg.Storage.Path, "err", err)
+			st = nil
+		} else {
+			defer st.Close()
+		}
+
+		p := tea.NewProgram(ui.NewModel(cfg, st))
 		if _, err := p.Run(); err != nil {
 			logger.Error("tui crashed", "err", err)
 			return err

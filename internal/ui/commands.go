@@ -15,6 +15,7 @@ func (m Model) runCommand(name string) (nm Model, cmd tea.Cmd, ran bool) {
 	case "clear":
 		m = m.stopRun()
 		m.run.agent.Reset(context.Background())
+	m.ps.begin() // the next message opens a new stored session
 		m.run.tokens = 0
 		m.chat = m.chat.Clear()
 		m.input = m.input.Reset()
@@ -24,6 +25,11 @@ func (m Model) runCommand(name string) (nm Model, cmd tea.Cmd, ran bool) {
 		m.input = m.input.Reset()
 		nm, cmd = m.copyLast()
 		return nm, cmd, true
+	case "continue", "model", "provider", "rename":
+		m.input = m.input.Reset()
+		actions := map[string]string{"continue": "sessions", "model": "model", "provider": "providers", "rename": "session_rename"}
+		nm, cmd, ran := m.runProviderAction(actions[name])
+		return nm, cmd, ran
 	case "exit":
 		return m, tea.Quit, true
 	case "commands":
@@ -38,6 +44,7 @@ func (m Model) runCommand(name string) (nm Model, cmd tea.Cmd, ran bool) {
 func (m Model) newSession() Model {
 	m = m.stopRun()
 	m.run.agent.Reset(context.Background())
+	m.ps.begin() // the next message opens a new stored session
 	m.run.tokens = 0
 	m.chat = m.chat.Clear()
 	m.input = m.input.Reset().SetPlaceholder("Ask anything")
@@ -65,6 +72,9 @@ func (m Model) runAction(id string) (tea.Model, tea.Cmd) {
 		return m.layout(), nil
 	case "paste":
 		return m, pasteCmd()
+	}
+	if nm, cmd, ran := m.runProviderAction(id); ran {
+		return nm.layout(), cmd
 	}
 	if nm, cmd, ran := m.runCommand(id); ran {
 		return nm.layout(), cmd

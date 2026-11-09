@@ -22,9 +22,15 @@ func DefaultDialogItems() []DialogItem {
 		{"Suggested", "New session", "ctrl+n", "new"},
 		{"Suggested", "Copy last response", "/copy", "copy"},
 		{"Suggested", "Toggle sidebar", "ctrl+d", "sidebar"},
-		{"Suggested", "Switch model", "", "model"},
+		{"Suggested", "Switch model", "/model", "model"},
+
+		{"Provider", "Add provider", "/provider", "provider_add"},
+		{"Provider", "Switch provider", "", "providers"},
+		{"Provider", "Remove provider", "", "provider_remove"},
 
 		{"Session", "Switch session", "/continue", "sessions"},
+		{"Session", "Rename session", "/rename", "session_rename"},
+		{"Session", "Delete session", "", "session_delete"},
 		{"Session", "Compact session", "/compact", "compact"},
 		{"Session", "Clear chat", "ctrl+l", "clear"},
 
@@ -54,6 +60,7 @@ const (
 // DialogModel is a centered modal listing actions in groups, with a search
 // box on top. Typing filters, up/down moves, enter chooses, esc closes.
 type DialogModel struct {
+	title    string
 	items    []DialogItem
 	open     bool
 	query    string
@@ -64,7 +71,13 @@ type DialogModel struct {
 }
 
 func NewDialog(items []DialogItem) DialogModel {
-	return DialogModel{items: items}
+	return DialogModel{items: items, title: "Commands"}
+}
+
+// WithTitle sets the heading shown at the top of the box (default "Commands").
+func (d DialogModel) WithTitle(t string) DialogModel {
+	d.title = t
+	return d
 }
 
 func (d DialogModel) Visible() bool { return d.open }
@@ -300,9 +313,9 @@ func (d DialogModel) View() []string {
 	for i := 0; i < dialogPadTop; i++ {
 		rows = append(rows, blank)
 	}
-	title := text.Bold(true).Render("Commands")
+	title := text.Bold(true).Render(d.title)
 	esc := muted.Render("esc")
-	gap := bg.Render(spaces(inner - lipgloss.Width("Commands") - lipgloss.Width("esc")))
+	gap := bg.Render(spaces(inner - lipgloss.Width(d.title) - lipgloss.Width("esc")))
 	rows = append(rows, pad+title+gap+esc+pad, blank)
 
 	// search row
