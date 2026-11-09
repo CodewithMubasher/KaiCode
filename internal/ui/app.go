@@ -41,6 +41,7 @@ bodyH         int
 chat    components.ChatModel
 input   components.InputModel
 sidebar components.SidebarModel
+palette components.PaletteModel
 
 screen Screen
 state  AppState
@@ -54,6 +55,7 @@ return Model{
 chat:    components.NewChat(80, 20),
 input:   components.NewInput(80).SetPlaceholder("Ask anything"),
 sidebar: components.NewSidebar().SetSessionID("78393329910"), // TODO: real session id
+palette: components.NewPalette(components.DefaultCommands()),
 cfg:     cfg,
 screen:  ScreenHome,
 state:   StateIdle,
@@ -68,6 +70,8 @@ return tea.Tick(30*time.Millisecond, func(time.Time) tea.Msg { return tickMsg{} 
 
 // layout recomputes every component size from the terminal size.
 func (m Model) layout() Model {
+// the slash-command popup follows whatever is typed in the input
+m.palette = m.palette.Sync(m.input.Value())
 if m.width < minW || m.height < minH {
 return m
 }
@@ -76,6 +80,8 @@ inputW := m.width - 4
 if inputW > 64 {
 inputW = 64
 }
+// the popup may cover the banner and the gap above the input
+m.palette = m.palette.SetRows(lipgloss.Height(components.Banner(version.Version)) + 1)
 m.input = m.input.SetWidth(inputW + 2*components.Margin)
 return m
 }
@@ -95,6 +101,7 @@ if chatH < 1 {
 chatH = 1
 }
 m.chat = m.chat.SetSize(mainW, chatH)
+m.palette = m.palette.SetRows(chatH)
 m.sidebar = m.sidebar.SetSize(sideW, m.bodyH)
 return m
 }
@@ -143,6 +150,24 @@ m.chat = m.chat.ScrollDown(3)
 return m, nil
 
 case tea.KeyPressMsg:
+if m.palette.Visible() {
+switch msg.String() {
+case "up", "ctrl+p":
+m.palette = m.palette.Up()
+return m, nil
+case "down", "ctrl+n":
+m.palette = m.palette.Down()
+return m, nil
+case "tab", "enter":
+if c, ok := m.palette.Selected(); ok {
+m.input = m.input.SetValue("/" + c.Name + " ")
+}
+return m.layout(), nil
+case "esc":
+m.palette = m.palette.Dismiss(m.input.Value())
+return m, nil
+}
+}
 switch msg.String() {
 case "ctrl+c", "esc":
 if m.input.Value() == "" {
@@ -202,6 +227,10 @@ components.Banner(version.Version),
 "",
 m.input.View(),
 )
+// slash-command popup sits right above the input
+inputTop := lipgloss.Height(block) - m.input.Height()
+popupX := (lipgloss.Width(block)-m.input.Width())/2 + components.Margin
+block = components.OverlayString(block, m.palette.View(m.input.Width()-2*components.Margin), popupX, inputTop)
 content = lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Position(0.52), block)
 } else {
 gap := strings.Repeat(" ", m.mainW)
@@ -210,6 +239,8 @@ m.chat.View(),
 m.input.View(),
 gap,
 )
+// slash-command popup sits right above the input
+mainCol = components.OverlayString(mainCol, m.palette.View(m.mainW-2*components.Margin), components.Margin, lipgloss.Height(m.chat.View()))
 content = lipgloss.JoinHorizontal(lipgloss.Top,
 mainCol, m.sidebar.View(),
 )

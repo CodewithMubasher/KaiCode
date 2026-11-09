@@ -18,6 +18,8 @@ const (
 const (
 	typingCursor = "▍"
 	readFileHold = 12 // ticks (~360ms) a "Read file" step stays current
+	shellHold    = 10 // ticks (~300ms) a shell command "runs" before its output types
+	editHold     = 8  // ticks before an edit starts drawing its diff
 )
 
 // Heading ids for hover/click hit-testing:
@@ -38,6 +40,10 @@ const (
 	StepThinking StepKind = iota
 	// StepReadFile is a simple, non-collapsible "Read file (path)" line.
 	StepReadFile
+	// StepShell is a command panel: "$ cmd" plus its output.
+	StepShell
+	// StepEdit is a diff card: "← Edit path" plus changed lines.
+	StepEdit
 )
 
 // Step is one entry in an assistant reply, shown in order above the answer.
@@ -45,6 +51,9 @@ type Step struct {
 	Kind     StepKind
 	Timeline Timeline // StepThinking
 	Path     string   // StepReadFile
+	Command  string   // StepShell
+	Output   string   // StepShell
+	Diff     []DiffLine // StepEdit
 }
 
 // Message is one chat entry. Assistant messages carry ordered Steps
@@ -69,6 +78,13 @@ type liveStep struct {
 	// read file
 	path string
 	age  int
+
+	// shell (age and shown are shared with the kinds above)
+	cmd string
+	out []rune
+
+	// edit (path is the file; shown counts diff lines drawn)
+	diff []DiffLine
 
 	finished bool
 }
@@ -197,6 +213,30 @@ func (c ChatModel) ReadFile(path string) ChatModel {
 	return c
 }
 
+// RunShell adds a shell step: the command shows at once, then its output
+// types in after a short "running" pause.
+func (c ChatModel) RunShell(cmd, output string) ChatModel {
+	steps := c.cloneSteps()
+	if n := len(steps); n > 0 && steps[n-1].kind == StepThinking && !steps[n-1].thinkDone {
+		steps[n-1].thinkDone = true
+	}
+	steps = append(steps, liveStep{kind: StepShell, cmd: cmd, out: []rune(output)})
+	c.live.steps = steps
+	return c
+}
+
+// EditFile adds an edit step: the header shows at once, then the diff
+// lines are drawn one by one.
+func (c ChatModel) EditFile(path string, diff []DiffLine) ChatModel {
+	steps := c.cloneSteps()
+	if n := len(steps); n > 0 && steps[n-1].kind == StepThinking && !steps[n-1].thinkDone {
+		steps[n-1].thinkDone = true
+	}
+	steps = append(steps, liveStep{kind: StepEdit, path: path, diff: diff})
+	c.live.steps = steps
+	return c
+}
+
 // StreamAnswer appends final-answer text. It starts typing after every
 // step has finished.
 func (c ChatModel) StreamAnswer(s string) ChatModel {
@@ -235,8 +275,13 @@ func firstUnfinished(steps []liveStep) int {
 }
 
 func (s liveStep) toStep() Step {
-	if s.kind == StepReadFile {
+	switch s.kind {
+	case StepReadFile:
 		return Step{Kind: StepReadFile, Path: s.path}
+	case StepShell:
+		return Step{Kind: StepShell, Command: s.cmd, Output: string(s.out)}
+	case StepEdit:
+		return Step{Kind: StepEdit, Path: s.path, Diff: s.diff}
 	}
 	tl := Timeline{Collapsed: s.hidden, Took: s.took}
 	if len(s.think) > 0 {
@@ -267,6 +312,23 @@ func (c ChatModel) Tick() ChatModel {
 			s.age++
 			if s.age >= readFileHold {
 				s.finished = true
+			}
+		case StepShell:
+			s.age++
+			if s.age >= shellHold {
+				s.shown = reveal(s.shown, len(s.out))
+				if s.shown >= len(s.out) {
+					s.finished = true
+				}
+			}
+		case StepEdit:
+			s.age++
+			if s.age >= editHold {
+				s.shown = (s.age-editHold)/2 + 1 // one diff line every 2 ticks
+				if s.shown >= len(s.diff) {
+					s.shown = len(s.diff)
+					s.finished = true
+				}
 			}
 		}
 		c.live.steps = steps
@@ -320,8 +382,8 @@ func (c ChatModel) ScrollDown(n int) ChatModel {
 // answerLines renders final answer text at full brightness.
 func answerLines(text string, cw int) []string {
 	var out []string
-	for _, l := range wrapText(text, cw-3) {
-		out = append(out, "   "+TextStyle.Render(l))
+	for _, l := range renderMarkdown(text, cw-3) {
+		out = append(out, "   "+l)
 	}
 	return out
 }
@@ -374,6 +436,10 @@ func (c ChatModel) lines() []row {
 					out = append(out, c.timelineRows(st.Timeline, cw, spin, i*stepStride+j)...)
 				case StepReadFile:
 					out = append(out, plainRows([]string{readFileLine(st.Path)})...)
+				case StepShell:
+					out = append(out, plainRows(shellLines(st.Command, st.Output, cw))...)
+				case StepEdit:
+					out = append(out, plainRows(editLines(st.Path, st.Diff, cw))...)
 				}
 			}
 			if m.Text != "" {
@@ -407,6 +473,14 @@ func (c ChatModel) lines() []row {
 				out = append(out, c.timelineRows(tl, cw, spin, -(2+j))...)
 			case StepReadFile:
 				out = append(out, plainRows([]string{readFileLine(s.path)})...)
+			case StepShell:
+				text := string(s.out[:s.shown])
+				if !s.finished && s.age >= shellHold {
+					text += typingCursor
+				}
+				out = append(out, plainRows(shellLines(s.cmd, text, cw))...)
+			case StepEdit:
+				out = append(out, plainRows(editLines(s.path, s.diff[:s.shown], cw))...)
 			}
 			if !s.finished {
 				break // later steps appear once this one is done

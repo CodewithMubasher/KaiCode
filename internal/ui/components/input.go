@@ -32,6 +32,16 @@ return i
 
 func (i InputModel) Value() string { return string(i.value) }
 
+// Width is the full rendered width of the input.
+func (i InputModel) Width() int { return i.width }
+
+// SetValue replaces the text and puts the cursor at the end.
+func (i InputModel) SetValue(s string) InputModel {
+i.value = []rune(s)
+i.cursor = len(i.value)
+return i
+}
+
 func (i InputModel) Reset() InputModel {
 i.value = nil
 i.cursor = 0
