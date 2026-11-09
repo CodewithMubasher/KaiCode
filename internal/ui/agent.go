@@ -53,6 +53,7 @@ func newRunState(cfg *config.Config, ps *persister, hub *providerHub) runState {
 	reg.Register(tools.ReadFile{})
 	reg.Register(tools.Shell{})
 	reg.Register(tools.EditFile{})
+	reg.Register(tools.CreateFile{})
 
 	active := activeProvider{Kind: "web"}
 	switch {
