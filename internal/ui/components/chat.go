@@ -1,6 +1,7 @@
 package components
 
 import (
+	"math"
 	"strings"
 	"time"
 
@@ -559,6 +560,61 @@ func (c ChatModel) Click(x, y int) ChatModel {
 	c.hovering = true
 	c.hover = id
 	return c.clamp()
+}
+
+// words counts whitespace-separated words in s.
+func words(s string) int { return len(strings.Fields(s)) }
+
+// Words counts every word in the conversation as it stands right now,
+// including the part of the live reply that has been typed so far.
+func (c ChatModel) Words() int {
+	n := 0
+	for _, m := range c.messages {
+		n += words(m.Text)
+		for _, st := range m.Steps {
+			switch st.Kind {
+			case StepThinking:
+				for _, nd := range st.Timeline.Nodes {
+					n += words(nd.Content)
+				}
+			case StepReadFile:
+				n += words("Read file " + st.Path)
+			case StepShell:
+				n += words(st.Command) + words(st.Output)
+			case StepEdit:
+				n += words(st.Path) + diffWords(st.Diff)
+			}
+		}
+	}
+	if c.active {
+		for _, s := range c.live.steps {
+			switch s.kind {
+			case StepThinking:
+				n += words(string(s.think[:s.shown]))
+			case StepReadFile:
+				n += words("Read file " + s.path)
+			case StepShell:
+				n += words(s.cmd) + words(string(s.out[:s.shown]))
+			case StepEdit:
+				n += words(s.path) + diffWords(s.diff[:s.shown])
+			}
+		}
+		n += words(string(c.live.answer[:c.live.answerShown]))
+	}
+	return n
+}
+
+func diffWords(d []DiffLine) int {
+	n := 0
+	for _, l := range d {
+		n += words(l.Text)
+	}
+	return n
+}
+
+// Tokens estimates the context used: words * 1.3, rounded.
+func (c ChatModel) Tokens() int {
+	return int(math.Round(float64(c.Words()) * 1.3))
 }
 
 func (c ChatModel) View() string {

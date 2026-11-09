@@ -13,6 +13,9 @@ tea "charm.land/bubbletea/v2"
 "kai/internal/version"
 )
 
+// contextWindow is the model context size the sidebar measures against.
+const contextWindow = 256_000
+
 const (
 minW = 60
 minH = 14
@@ -54,7 +57,7 @@ func NewModel(cfg *config.Config) Model {
 return Model{
 chat:    components.NewChat(80, 20),
 input:   components.NewInput(80).SetPlaceholder("Ask anything"),
-sidebar: components.NewSidebar().SetSessionID("78393329910"), // TODO: real session id
+sidebar: components.NewSidebar().SetSessionID("78393329910").SetVersion(version.Version).SetCwd(cwdLabel()), // TODO: real session id
 palette: components.NewPalette(components.DefaultCommands()),
 cfg:     cfg,
 screen:  ScreenHome,
@@ -132,6 +135,7 @@ return m, tick()
 
 case tea.MouseMotionMsg:
 m.chat = m.chat.Hover(msg.X, msg.Y)
+m.sidebar = m.sidebar.Hover(msg.X-m.mainW, msg.Y)
 return m, nil
 
 case tea.MouseClickMsg:
@@ -242,7 +246,7 @@ gap,
 // slash-command popup sits right above the input
 mainCol = components.OverlayString(mainCol, m.palette.View(m.mainW-2*components.Margin), components.Margin, lipgloss.Height(m.chat.View()))
 content = lipgloss.JoinHorizontal(lipgloss.Top,
-mainCol, m.sidebar.View(),
+mainCol, m.sidebar.SetContext(m.chat.Tokens(), contextWindow).View(),
 )
 }
 
