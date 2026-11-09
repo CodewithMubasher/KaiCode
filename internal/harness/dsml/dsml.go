@@ -77,3 +77,4 @@ func parseInvokes(body string, nextID func() string) ([]tools.Call, []string) {
 	}
 	return calls, warns
 }
+
