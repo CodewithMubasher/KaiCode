@@ -261,3 +261,59 @@ func TestByteOrderMarkIsDropped(t *testing.T) {
 		t.Errorf("text = %q", text)
 	}
 }
+
+func TestProgressWhileEditIsBeingWritten(t *testing.T) {
+	p := NewParser()
+	head := `<|DSML|tool_calls>` + "\n" +
+		`<|DSML|invoke name="edit_file">` + "\n" +
+		`<|DSML|parameter name="path" string="true">index.html</|DSML|parameter>` + "\n" +
+		`<|DSML|parameter name="new_string" string="true"><!DOCTYPE html>` + "\n" +
+		`<html>` + "\n" + `<body>` + "\n"
+	if text := p.Feed(head); strings.TrimSpace(text) != "" {
+		t.Fatalf("visible text = %q, want nothing while a call is written", text)
+	}
+
+	prog, ok := p.Progress()
+	if !ok {
+		t.Fatal("no progress while the call is still open")
+	}
+	if prog.Name != "edit_file" || prog.Path != "index.html" {
+		t.Errorf("progress = %+v", prog)
+	}
+	if !prog.Creating {
+		t.Error("no old_string yet: the call should count as creating a file")
+	}
+	if prog.Lines != 4 {
+		t.Errorf("lines = %d, want 4", prog.Lines)
+	}
+
+	p.Feed("</|DSML|parameter>\n</|DSML|invoke>\n</|DSML|tool_calls>")
+	if _, ok := p.Progress(); ok {
+		t.Error("progress must end once the call is complete")
+	}
+	calls := p.Calls()
+	if len(calls) != 1 || calls[0].Name != "edit_file" {
+		t.Fatalf("calls = %#v", calls)
+	}
+	if calls[0].Args["path"] != "index.html" {
+		t.Errorf("path arg = %v", calls[0].Args["path"])
+	}
+}
+
+func TestProgressTellsEditFromCreate(t *testing.T) {
+	p := NewParser()
+	p.Feed(`<|DSML|tool_calls><|DSML|invoke name="edit_file">` +
+		`<|DSML|parameter name="path" string="true">main.go</|DSML|parameter>` +
+		`<|DSML|parameter name="old_string" string="true">package main</|DSML|parameter>` +
+		`<|DSML|parameter name="new_string" string="true">package main` + "\n" + `// x`)
+	prog, ok := p.Progress()
+	if !ok {
+		t.Fatal("no progress")
+	}
+	if prog.Creating {
+		t.Error("a non-empty old_string means an edit, not a create")
+	}
+	if prog.Lines != 2 {
+		t.Errorf("lines = %d, want 2", prog.Lines)
+	}
+}

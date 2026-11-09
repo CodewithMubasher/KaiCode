@@ -15,6 +15,7 @@ func (m Model) runCommand(name string) (nm Model, cmd tea.Cmd, ran bool) {
 	case "clear":
 		m = m.stopRun()
 		m.run.agent.Reset(context.Background())
+		m.run.tokens = 0
 		m.chat = m.chat.Clear()
 		m.input = m.input.Reset()
 		m.state, m.fake = StateIdle, nil
@@ -37,6 +38,7 @@ func (m Model) runCommand(name string) (nm Model, cmd tea.Cmd, ran bool) {
 func (m Model) newSession() Model {
 	m = m.stopRun()
 	m.run.agent.Reset(context.Background())
+	m.run.tokens = 0
 	m.chat = m.chat.Clear()
 	m.input = m.input.Reset().SetPlaceholder("Ask anything")
 	m.screen = ScreenHome

@@ -85,7 +85,9 @@ func highlightCode(line string, st lipgloss.Style) string {
 //	▍   205  - content = ...0.45...     (red row)
 //	▍   205  + content = ...0.40...     (teal row)
 //	▍
-func editLines(path string, diff []DiffLine, w int) []string {
+//
+// A new file uses "＋ Create path" and only added lines.
+func editLines(path string, create bool, diff []DiffLine, w int) []string {
 	const lead, tail = 2, 2
 	pw := w - 1
 	inner := pw - lead - tail
@@ -97,8 +99,10 @@ func editLines(path string, diff []DiffLine, w int) []string {
 
 	numW := 3
 	for _, d := range diff {
-		if n := len(strconv.Itoa(d.Num)); n > numW {
-			numW = n
+		if d.Num > 0 {
+			if n := len(strconv.Itoa(d.Num)); n > numW {
+				numW = n
+			}
 		}
 	}
 	// region = pad + num + space + sign + space + code + pad
@@ -107,7 +111,11 @@ func editLines(path string, diff []DiffLine, w int) []string {
 		codeW = 4
 	}
 
-	head := hardWrap("← Edit "+path, inner)[0]
+	title := "← Edit " + path
+	if create {
+		title = "＋ Create " + path
+	}
+	head := hardWrap(title, inner)[0]
 	out := []string{
 		blank,
 		bg.Render(spaces(lead)) + bg.Foreground(ColMuted).Bold(true).Render(padRight(head, inner)) + bg.Render(spaces(tail)),
@@ -127,7 +135,7 @@ func editLines(path string, diff []DiffLine, w int) []string {
 		st := lipgloss.NewStyle().Background(rowBg)
 		for n, chunk := range hardWrap(strings.ReplaceAll(d.Text, "\t", "    "), codeW) {
 			num, sg := spaces(numW), " "
-			if n == 0 {
+			if n == 0 && d.Num > 0 {
 				num = spaces(numW-len(strconv.Itoa(d.Num))) + strconv.Itoa(d.Num)
 				sg = sign
 			}

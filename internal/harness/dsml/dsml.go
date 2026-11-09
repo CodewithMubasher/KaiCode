@@ -39,6 +39,12 @@ var (
 	paramRe      = regexp.MustCompile(`(?is)` + pre + `parameter\s+name\s*=\s*` + quote + `([^"']*)` + quote +
 		`(?:\s+string\s*=\s*` + quote + `(true|false)` + quote + `)?\s*>(.*?)` + closePre + `parameter\s*>`)
 
+	// The same tags while they are still being written (no closing tag yet).
+	invokeOpenRe  = regexp.MustCompile(`(?i)` + pre + `invoke\s+name\s*=\s*` + quote + `([^"']*)` + quote + `\s*>`)
+	invokeCloseRe = regexp.MustCompile(`(?i)` + closePre + `invoke\s*>`)
+	paramOpenRe   = regexp.MustCompile(`(?i)` + pre + `parameter\s+name\s*=\s*` + quote + `([^"']*)` + quote + `[^>]*>`)
+	paramCloseRe  = regexp.MustCompile(`(?i)` + closePre + `parameter\s*>`)
+
 	// <|end▁of▁sentence|> and friends: model control tokens that sometimes
 	// leak into the text.
 	specialRe = regexp.MustCompile(`(?i)<` + bar + `\s*(?:begin|end)[▁_ ]?of[▁_ ]?sentence\s*` + bar + `>`)

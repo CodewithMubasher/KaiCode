@@ -40,6 +40,74 @@ func (p *Parser) Warnings() []string { return p.warns }
 // InCalls reports whether the parser is inside a tool_calls block.
 func (p *Parser) InCalls() bool { return p.inCalls }
 
+// ToolProgress describes a tool call the model is still writing, so the UI can
+// show it before the call is complete.
+type ToolProgress struct {
+	Name     string // tool name, e.g. "edit_file"
+	Path     string // the path argument, once its tag has arrived
+	Lines    int    // lines of new content received so far
+	Creating bool   // no old_string (or an empty one): a new file
+}
+
+// Progress returns the call currently being written, if one is open. It is
+// only meaningful while the reply is streaming: once the invoke is closed the
+// call is complete and reported through Calls.
+func (p *Parser) Progress() (ToolProgress, bool) {
+	if !p.inCalls {
+		return ToolProgress{}, false
+	}
+	locs := invokeOpenRe.FindAllStringSubmatchIndex(p.buf, -1)
+	if len(locs) == 0 {
+		return ToolProgress{}, false
+	}
+	last := locs[len(locs)-1]
+	body := p.buf[last[1]:]
+	if invokeCloseRe.MatchString(body) {
+		return ToolProgress{}, false // the last call is complete
+	}
+
+	prog := ToolProgress{Name: p.buf[last[2]:last[3]], Creating: true}
+	if v, closed, ok := partialParam(body, "path"); ok && closed {
+		prog.Path = strings.TrimSpace(v)
+	}
+	if v, _, ok := partialParam(body, "new_string"); ok {
+		prog.Lines = lineCount(v)
+	} else if v, _, ok := partialParam(body, "content"); ok {
+		prog.Lines = lineCount(v)
+	}
+	if old, _, ok := partialParam(body, "old_string"); ok {
+		prog.Creating = strings.TrimSpace(old) == ""
+	}
+	if prog.Name == "" || prog.Path == "" {
+		return ToolProgress{}, false
+	}
+	return prog, true
+}
+
+// partialParam returns the value of a parameter inside body and whether its
+// closing tag has arrived; the value stops at that tag or at the end of body.
+func partialParam(body, name string) (value string, closed, found bool) {
+	for _, m := range paramOpenRe.FindAllStringSubmatchIndex(body, -1) {
+		if body[m[2]:m[3]] != name {
+			continue
+		}
+		rest := body[m[1]:]
+		if loc := paramCloseRe.FindStringIndex(rest); loc != nil {
+			return rest[:loc[0]], true, true
+		}
+		return rest, false, true
+	}
+	return "", false, false
+}
+
+// lineCount counts the lines in a parameter value; 0 while it is still empty.
+func lineCount(s string) int {
+	if s == "" {
+		return 0
+	}
+	return strings.Count(s, "\n") + 1
+}
+
 func (p *Parser) nextID() string {
 	p.seq++
 	return fmt.Sprintf("call_%d", p.seq)

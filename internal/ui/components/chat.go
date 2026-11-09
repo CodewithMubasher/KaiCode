@@ -1,7 +1,7 @@
 package components
 
 import (
-	"math"
+	"fmt"
 	"strings"
 	"time"
 
@@ -16,18 +16,6 @@ const (
 	RoleError
 )
 
-const (
-	typingCursor = "▍"
-	readFileHold = 12 // ticks (~360ms) a "Read file" step stays current
-	shellHold    = 10 // ticks (~300ms) a shell command "runs" before its output types
-	editHold     = 8  // ticks before an edit starts drawing its diff
-)
-
-// Heading ids for hover/click hit-testing:
-//
-//	headNone        no heading
-//	>= 0            message*stepStride + step (committed history)
-//	<= -2           live reply step, index = -id-2
 const (
 	headNone   = -1
 	stepStride = 1000
@@ -45,16 +33,20 @@ const (
 	StepShell
 	// StepEdit is a diff card: "← Edit path" plus changed lines.
 	StepEdit
+	// StepWriting is live-only: a tool call is still arriving. It is replaced
+	// by the real step when the call is complete, never kept in history.
+	StepWriting
 )
 
 // Step is one entry in an assistant reply, shown in order above the answer.
 type Step struct {
 	Kind     StepKind
 	Timeline Timeline // StepThinking
-	Path     string   // StepReadFile
+	Path     string   // StepReadFile, StepEdit
 	Command  string   // StepShell
 	Output   string   // StepShell
 	Diff     []DiffLine // StepEdit
+	Create   bool       // StepEdit: a new file rather than a change
 }
 
 // Message is one chat entry. Assistant messages carry ordered Steps
@@ -66,36 +58,37 @@ type Message struct {
 	Stopped bool // the user pressed esc mid-reply; a STOPPED marker follows it
 }
 
-// liveStep is a step of the reply currently being streamed.
+// liveStep is a step of the reply currently being streamed. Everything the
+// provider sends is shown at once; only the spinner animates.
 type liveStep struct {
 	kind StepKind
 
 	// thinking
 	think     []rune
-	shown     int
 	thinkDone bool
 	took      time.Duration
-	hidden    bool // nodes hidden (auto after typing, or toggled by click)
+	hidden    bool // nodes hidden (collapsed when thinking ends, or by click)
 
 	// read file
 	path string
-	age  int
 
-	// shell (age and shown are shared with the kinds above)
+	// shell
 	cmd string
 	out []rune
 
-	// edit (path is the file; shown counts diff lines drawn)
+	// edit
 	diff []DiffLine
 
-	finished bool
+	// writing (a tool call is still arriving; path/name/lines update live)
+	name   string
+	lines  int
+	create bool
 }
 
 type liveReply struct {
-	steps       []liveStep
-	answer      []rune
-	answerShown int
-	answerDone  bool
+	steps      []liveStep
+	answer     []rune
+	answerDone bool
 }
 
 type ChatModel struct {
@@ -158,7 +151,7 @@ func (c ChatModel) AppendError(text string) ChatModel {
 	return c
 }
 
-// Active reports whether a reply is still being streamed/typed.
+// Active reports whether a reply is still being streamed.
 func (c ChatModel) Active() bool { return c.active }
 
 func (c ChatModel) cloneSteps() []liveStep {
@@ -167,16 +160,16 @@ func (c ChatModel) cloneSteps() []liveStep {
 	return steps
 }
 
-// Stop cuts the running reply short (esc). Whatever is already on screen is
-// kept as a normal message and flagged Stopped, so the chat ends it with a
-// STOPPED marker. Text that was queued but not yet typed is dropped.
+// Stop cuts the running reply short (esc). Whatever has arrived is kept as a
+// normal message and flagged Stopped, so the chat ends it with a STOPPED
+// marker.
 func (c ChatModel) Stop() ChatModel { return c.cut(true) }
 
 // Fail ends the running reply the same way, without the STOPPED marker, and
 // adds an error row under it.
 func (c ChatModel) Fail(text string) ChatModel { return c.cut(false).AppendError(text) }
 
-// DemoteAnswer turns the answer text typed so far into a finished thought.
+// DemoteAnswer turns the answer text received so far into a finished thought.
 // The harness calls it when a tool call follows some text: that text was the
 // model thinking out loud, not the final answer.
 func (c ChatModel) DemoteAnswer() ChatModel {
@@ -187,7 +180,6 @@ func (c ChatModel) DemoteAnswer() ChatModel {
 	steps = append(steps, liveStep{kind: StepThinking, think: c.live.answer, thinkDone: true, took: time.Second})
 	c.live.steps = steps
 	c.live.answer = nil
-	c.live.answerShown = 0
 	c.live.answerDone = false
 	return c
 }
@@ -198,31 +190,16 @@ func (c ChatModel) cut(stopped bool) ChatModel {
 	}
 	l := c.live
 	msg := Message{Role: RoleAssistant, Stopped: stopped}
-	cutAt := firstUnfinished(l.steps) // the step that was in progress, or -1
-	for i, s := range l.steps {
-		if cutAt >= 0 && i > cutAt {
-			break // never shown yet
+	for _, s := range l.steps {
+		if s.kind == StepWriting || (s.kind == StepThinking && len(s.think) == 0) {
+			continue // nothing of this step was ever on screen
 		}
-		if i == cutAt {
-			switch s.kind {
-			case StepThinking:
-				n := min(s.shown, len(s.think))
-				if n == 0 {
-					continue // nothing was typed, so there is nothing to keep
-				}
-				s.think = s.think[:n]
-				s.hidden = false // keep the cut-off thought visible
-			case StepShell:
-				s.out = s.out[:min(s.shown, len(s.out))]
-			case StepEdit:
-				s.diff = s.diff[:min(s.shown, len(s.diff))]
-			}
+		if s.kind == StepThinking {
+			s.hidden = false // keep the cut-off thought visible
 		}
 		msg.Steps = append(msg.Steps, s.toStep())
 	}
-	if cutAt < 0 {
-		msg.Text = string(l.answer[:min(l.answerShown, len(l.answer))])
-	}
+	msg.Text = string(l.answer)
 	if stopped || len(msg.Steps) > 0 || msg.Text != "" {
 		c.messages = append(c.messages, msg)
 	}
@@ -247,11 +224,12 @@ func stoppedLine(cw int) string {
 		LineStyle.Render(strings.Repeat("-", dashes-left))
 }
 
-// StartReply begins a new streamed reply. A thinking step starts spinning
-// immediately.
+// StartReply begins a new streamed reply. No step is created yet: the thinking
+// timeline only appears once the model actually sends reasoning, so replies
+// without it do not show an empty "thought" line.
 func (c ChatModel) StartReply() ChatModel {
 	c.active = true
-	c.live = liveReply{steps: []liveStep{{kind: StepThinking}}}
+	c.live = liveReply{}
 	c.frame = 0
 	c.offset = 0
 	return c
@@ -260,6 +238,9 @@ func (c ChatModel) StartReply() ChatModel {
 // StreamThinking appends thinking text to the current thinking step (or
 // starts a new one after a Read file step / finished thinking).
 func (c ChatModel) StreamThinking(s string) ChatModel {
+	if s == "" {
+		return c
+	}
 	steps := c.cloneSteps()
 	n := len(steps)
 	if n == 0 || steps[n-1].kind != StepThinking || steps[n-1].thinkDone {
@@ -271,14 +252,15 @@ func (c ChatModel) StreamThinking(s string) ChatModel {
 	return c
 }
 
-// EndThinking marks the current thinking step as complete. Once its text
-// has been typed it stops spinning and collapses to its heading.
+// EndThinking marks the current thinking step as complete: it stops spinning
+// and collapses to its heading.
 func (c ChatModel) EndThinking(took time.Duration) ChatModel {
 	steps := c.cloneSteps()
 	n := len(steps)
 	if n > 0 && steps[n-1].kind == StepThinking && !steps[n-1].thinkDone {
 		steps[n-1].thinkDone = true
 		steps[n-1].took = took
+		steps[n-1].hidden = true
 	}
 	c.live.steps = steps
 	return c
@@ -295,8 +277,7 @@ func (c ChatModel) ReadFile(path string) ChatModel {
 	return c
 }
 
-// RunShell adds a shell step: the command shows at once, then its output
-// types in after a short "running" pause.
+// RunShell adds a shell step: the command and its output show at once.
 func (c ChatModel) RunShell(cmd, output string) ChatModel {
 	steps := c.cloneSteps()
 	if n := len(steps); n > 0 && steps[n-1].kind == StepThinking && !steps[n-1].thinkDone {
@@ -307,53 +288,59 @@ func (c ChatModel) RunShell(cmd, output string) ChatModel {
 	return c
 }
 
-// EditFile adds an edit step: the header shows at once, then the diff
-// lines are drawn one by one.
-func (c ChatModel) EditFile(path string, diff []DiffLine) ChatModel {
+// EditFile adds an edit step with its full diff. create marks a brand-new
+// file.
+func (c ChatModel) EditFile(path string, create bool, diff []DiffLine) ChatModel {
 	steps := c.cloneSteps()
 	if n := len(steps); n > 0 && steps[n-1].kind == StepThinking && !steps[n-1].thinkDone {
 		steps[n-1].thinkDone = true
 	}
-	steps = append(steps, liveStep{kind: StepEdit, path: path, diff: diff})
+	steps = append(steps, liveStep{kind: StepEdit, path: path, diff: diff, create: create})
 	c.live.steps = steps
 	return c
 }
 
-// StreamAnswer appends final-answer text. It starts typing after every
-// step has finished.
+// WriteProgress shows a tool call while the model is still writing it: a
+// "creating/editing path" line whose line count grows with the reply. The
+// step is replaced by the real edit card when the call completes.
+func (c ChatModel) WriteProgress(name, path string, lines int, creating bool) ChatModel {
+	steps := c.cloneSteps()
+	if n := len(steps); n > 0 && steps[n-1].kind == StepThinking && !steps[n-1].thinkDone {
+		steps[n-1].thinkDone = true
+	}
+	if n := len(steps); n > 0 && steps[n-1].kind == StepWriting {
+		steps[n-1].name, steps[n-1].path = name, path
+		steps[n-1].lines, steps[n-1].create = lines, creating
+		c.live.steps = steps
+		return c
+	}
+	steps = append(steps, liveStep{kind: StepWriting, name: name, path: path, lines: lines, create: creating})
+	c.live.steps = steps
+	return c
+}
+
+// EndWrite drops the live writing step, if any. The real tool step takes over
+// from here.
+func (c ChatModel) EndWrite() ChatModel {
+	steps := c.cloneSteps()
+	for len(steps) > 0 && steps[len(steps)-1].kind == StepWriting {
+		steps = steps[:len(steps)-1]
+	}
+	c.live.steps = steps
+	return c
+}
+
+// StreamAnswer appends final-answer text; it shows at once.
 func (c ChatModel) StreamAnswer(s string) ChatModel {
 	c.live.answer = append(c.live.answer, []rune(s)...)
 	return c
 }
 
 // EndAnswer marks the answer as complete; the reply is committed to the
-// history once everything has been typed.
+// history on the next Tick.
 func (c ChatModel) EndAnswer() ChatModel {
 	c.live.answerDone = true
 	return c
-}
-
-// reveal returns how many runes should be visible after one tick. It types
-// slowly when caught up and speeds up when there is a backlog.
-func reveal(shown, total int) int {
-	backlog := total - shown
-	if backlog <= 0 {
-		return shown
-	}
-	step := 2 + backlog/15
-	if step > backlog {
-		step = backlog
-	}
-	return shown + step
-}
-
-func firstUnfinished(steps []liveStep) int {
-	for i, s := range steps {
-		if !s.finished {
-			return i
-		}
-	}
-	return -1
 }
 
 func (s liveStep) toStep() Step {
@@ -363,7 +350,7 @@ func (s liveStep) toStep() Step {
 	case StepShell:
 		return Step{Kind: StepShell, Command: s.cmd, Output: string(s.out)}
 	case StepEdit:
-		return Step{Kind: StepEdit, Path: s.path, Diff: s.diff}
+		return Step{Kind: StepEdit, Path: s.path, Diff: s.diff, Create: s.create}
 	}
 	tl := Timeline{Collapsed: s.hidden, Took: s.took}
 	if len(s.think) > 0 {
@@ -372,64 +359,24 @@ func (s liveStep) toStep() Step {
 	return Step{Kind: StepThinking, Timeline: tl}
 }
 
-// Tick advances animation and typing by one frame (call every ~30ms).
-// Steps are processed strictly in order; the answer types last.
+// Tick advances the spinner by one frame (call every ~30ms) and commits the
+// reply to the history once the stream has ended.
 func (c ChatModel) Tick() ChatModel {
 	c.frame++
-	if !c.active {
+	if !c.active || !c.live.answerDone {
 		return c
 	}
-
-	if idx := firstUnfinished(c.live.steps); idx >= 0 {
-		steps := c.cloneSteps()
-		s := &steps[idx]
-		switch s.kind {
-		case StepThinking:
-			s.shown = reveal(s.shown, len(s.think))
-			if s.thinkDone && s.shown >= len(s.think) {
-				s.finished = true
-				s.hidden = true // auto-collapse to the heading
-			}
-		case StepReadFile:
-			s.age++
-			if s.age >= readFileHold {
-				s.finished = true
-			}
-		case StepShell:
-			s.age++
-			if s.age >= shellHold {
-				s.shown = reveal(s.shown, len(s.out))
-				if s.shown >= len(s.out) {
-					s.finished = true
-				}
-			}
-		case StepEdit:
-			s.age++
-			if s.age >= editHold {
-				s.shown = (s.age-editHold)/2 + 1 // one diff line every 2 ticks
-				if s.shown >= len(s.diff) {
-					s.shown = len(s.diff)
-					s.finished = true
-				}
-			}
-		}
-		c.live.steps = steps
-		return c
-	}
-
 	l := c.live
-	l.answerShown = reveal(l.answerShown, len(l.answer))
-	if l.answerDone && l.answerShown >= len(l.answer) {
-		msg := Message{Role: RoleAssistant, Text: string(l.answer)}
-		for _, s := range l.steps {
-			msg.Steps = append(msg.Steps, s.toStep())
+	msg := Message{Role: RoleAssistant, Text: string(l.answer)}
+	for _, s := range l.steps {
+		if s.kind == StepWriting {
+			continue
 		}
-		c.messages = append(c.messages, msg)
-		c.active = false
-		c.live = liveReply{}
-		return c
+		msg.Steps = append(msg.Steps, s.toStep())
 	}
-	c.live = l
+	c.messages = append(c.messages, msg)
+	c.active = false
+	c.live = liveReply{}
 	return c
 }
 
@@ -477,6 +424,22 @@ func readFileLine(path string) string {
 		DimStyle.Render("(") + MutedStyle.Render(path) + DimStyle.Render(")")
 }
 
+// writeLine renders the tool call the model is still writing:
+//
+//	✎ creating index.html · 128 lines
+func writeLine(path string, create bool, lines int) string {
+	verb, icon := "editing", "✎"
+	if create {
+		verb, icon = "creating", "＋"
+	}
+	out := " " + AccentStyle.Render(icon) + " " +
+		AccentStyle.Render(verb) + " " + MutedStyle.Render(path)
+	if lines > 0 {
+		out += DimStyle.Render(" · ") + MutedStyle.Render(fmt.Sprintf("%d lines", lines))
+	}
+	return out
+}
+
 func plainRows(lines []string) []row {
 	rows := make([]row, len(lines))
 	for i, l := range lines {
@@ -521,7 +484,7 @@ func (c ChatModel) lines() []row {
 				case StepShell:
 					out = append(out, plainRows(shellLines(st.Command, st.Output, cw))...)
 				case StepEdit:
-					out = append(out, plainRows(editLines(st.Path, st.Diff, cw))...)
+					out = append(out, plainRows(editLines(st.Path, st.Create, st.Diff, cw))...)
 				}
 			}
 			if m.Text != "" {
@@ -549,32 +512,24 @@ func (c ChatModel) lines() []row {
 			}
 			switch s.kind {
 			case StepThinking:
-				tl := Timeline{Running: !s.finished, Collapsed: s.hidden, Took: s.took}
-				switch {
-				case !s.finished && s.shown > 0:
-					tl.Nodes = []TimelineNode{{Content: string(s.think[:s.shown]) + typingCursor}}
-				case s.finished && len(s.think) > 0:
+				tl := Timeline{Running: !s.thinkDone, Collapsed: s.hidden, Took: s.took}
+				if len(s.think) > 0 {
 					tl.Nodes = []TimelineNode{{Content: string(s.think)}}
 				}
 				out = append(out, c.timelineRows(tl, cw, spin, -(2+j))...)
 			case StepReadFile:
 				out = append(out, plainRows([]string{readFileLine(s.path)})...)
 			case StepShell:
-				text := string(s.out[:s.shown])
-				if !s.finished && s.age >= shellHold {
-					text += typingCursor
-				}
-				out = append(out, plainRows(shellLines(s.cmd, text, cw))...)
+				out = append(out, plainRows(shellLines(s.cmd, string(s.out), cw))...)
 			case StepEdit:
-				out = append(out, plainRows(editLines(s.path, s.diff[:s.shown], cw))...)
-			}
-			if !s.finished {
-				break // later steps appear once this one is done
+				out = append(out, plainRows(editLines(s.path, s.create, s.diff, cw))...)
+			case StepWriting:
+				out = append(out, plainRows([]string{writeLine(s.path, s.create, s.lines)})...)
 			}
 		}
-		if firstUnfinished(l.steps) < 0 && (len(l.answer) > 0 || l.answerDone) {
+		if len(l.answer) > 0 {
 			out = append(out, blank...)
-			out = append(out, plainRows(answerLines(string(l.answer[:l.answerShown])+typingCursor, cw))...)
+			out = append(out, plainRows(answerLines(string(l.answer), cw))...)
 		}
 	}
 	return out
@@ -645,75 +600,6 @@ func (c ChatModel) Click(x, y int) ChatModel {
 	c.hovering = true
 	c.hover = id
 	return c.clamp()
-}
-
-// words counts whitespace-separated words in s.
-func words(s string) int { return len(strings.Fields(s)) }
-
-// wordCounts counts the words in the conversation as it stands right now,
-// including the part of the live reply typed so far. "in" is what is fed to
-// the model (user messages, command output); "out" is what the model wrote
-// (thinking, tool calls, edits, answers). The whole history is counted, so a
-// second turn is everything before it plus the new messages.
-func (c ChatModel) wordCounts() (in, out int) {
-	for _, m := range c.messages {
-		switch m.Role {
-		case RoleUser:
-			in += words(m.Text)
-		case RoleAssistant:
-			out += words(m.Text)
-		}
-		for _, st := range m.Steps {
-			switch st.Kind {
-			case StepThinking:
-				for _, nd := range st.Timeline.Nodes {
-					out += words(nd.Content)
-				}
-			case StepReadFile:
-				out += words("Read file " + st.Path)
-			case StepShell:
-				out += words(st.Command)
-				in += words(st.Output)
-			case StepEdit:
-				out += words(st.Path) + diffWords(st.Diff)
-			}
-		}
-	}
-	if c.active {
-		for _, s := range c.live.steps {
-			switch s.kind {
-			case StepThinking:
-				out += words(string(s.think[:s.shown]))
-			case StepReadFile:
-				out += words("Read file " + s.path)
-			case StepShell:
-				out += words(s.cmd)
-				in += words(string(s.out[:s.shown]))
-			case StepEdit:
-				out += words(s.path) + diffWords(s.diff[:s.shown])
-			}
-		}
-		out += words(string(c.live.answer[:c.live.answerShown]))
-	}
-	return in, out
-}
-
-func diffWords(d []DiffLine) int {
-	n := 0
-	for _, l := range d {
-		n += words(l.Text)
-	}
-	return n
-}
-
-// tokensPerWord is the rough conversion used for the context estimate.
-const tokensPerWord = 1.3
-
-// TokenCounts estimates input and output tokens: words * 1.3, rounded.
-// The context used is their sum.
-func (c ChatModel) TokenCounts() (in, out int) {
-	wi, wo := c.wordCounts()
-	return int(math.Round(float64(wi) * tokensPerWord)), int(math.Round(float64(wo) * tokensPerWord))
 }
 
 // LastAnswer returns the text of the last assistant reply ("" if none).

@@ -54,6 +54,9 @@ func kinds(evs []Event) []EventKind {
 	var ks []EventKind
 	var last EventKind = -1
 	for _, e := range evs {
+		if e.Kind == EvUsage || e.Kind == EvToolProgress {
+			continue // bookkeeping, not part of the reply's shape
+		}
 		if e.Kind != last { // collapse runs of text deltas
 			ks = append(ks, e.Kind)
 		}

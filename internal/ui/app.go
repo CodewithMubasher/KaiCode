@@ -348,9 +348,8 @@ gap,
 // slash-command popup sits right above the input
 mainCol = components.OverlayString(mainCol, m.palette.View(m.mainW-2*components.Margin), components.Margin, lipgloss.Height(m.chat.View()))
 if m.sideW > 0 {
-in, out := m.chat.TokenCounts()
 content = lipgloss.JoinHorizontal(lipgloss.Top,
-mainCol, m.sidebar.SetContext(in, out, contextWindow).View(),
+mainCol, m.sidebar.SetContext(m.run.tokens, contextWindow).View(),
 )
 } else {
 content = mainCol

@@ -46,6 +46,7 @@ type Agent struct {
 	started bool   // the current web chat has been given Kai's instructions
 	recap   string // recap to put in front of the next first message, after a lost chat
 	history []Entry
+	tokens  int // estimate of what the current web chat holds
 }
 
 func New(cfg Config) *Agent {
@@ -76,6 +77,7 @@ func newSessionID() string {
 func (a *Agent) Reset(ctx context.Context) {
 	a.mu.Lock()
 	a.parent, a.started, a.recap, a.history = nil, false, "", nil
+	a.tokens = 0
 	a.session = newSessionID()
 	sess := a.session
 	a.mu.Unlock()
@@ -106,6 +108,21 @@ func (a *Agent) parentID() *int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.parent
+}
+
+// addTokens records what the current web chat now holds. The web chat keeps
+// the history itself, so this is every prompt Kai sent plus every reply the
+// model wrote, including thinking and the tool-call markup.
+func (a *Agent) addTokens(n int) {
+	a.mu.Lock()
+	a.tokens += n
+	a.mu.Unlock()
+}
+
+func (a *Agent) tokensNow() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.tokens
 }
 
 // setParent is called when a reply begins: the chat now exists, so later
@@ -181,6 +198,7 @@ func (a *Agent) restartChat() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.parent, a.started = nil, false
+	a.tokens = 0 // the new chat starts empty
 	a.session = newSessionID()
 	a.recap = recap(a.history, recapBudget)
 	slog.Warn("web chat lost: starting a new chat with a recap", "session", a.session)
@@ -271,6 +289,21 @@ func (a *Agent) turn(ctx context.Context, prompt string, emit func(Event) bool) 
 		return res, err
 	}
 
+	// The usage gauge follows what the provider actually sees and writes: the
+	// prompt (instructions and tool specs included, on the first turn) plus
+	// every delta the model streams, markup and all.
+	used := -1
+	usage := func(force bool) {
+		tok := a.tokensNow()
+		if tok == used || (!force && tok-used < 40) {
+			return
+		}
+		used = tok
+		emit(Event{Kind: EvUsage, Tokens: tok})
+	}
+	a.addTokens(EstimateTokens(prompt))
+	usage(true)
+
 	var text strings.Builder
 	show := func(s string) bool {
 		if s == "" {
@@ -282,6 +315,7 @@ func (a *Agent) turn(ctx context.Context, prompt string, emit func(Event) bool) 
 
 	p := dsml.NewParser()
 	ended := false
+	var prog *ToolProgress // last progress reported for the call being written
 
 read:
 	for {
@@ -298,11 +332,23 @@ read:
 			case StreamReady:
 				a.setParent(ev.MessageID)
 			case StreamThinking:
+				a.addTokens(EstimateTokens(ev.Text))
+				usage(false)
 				if !emit(Event{Kind: EvThinking, Text: ev.Text}) {
 					return res, ctx.Err()
 				}
 			case StreamText:
-				if !show(p.Feed(ev.Text)) {
+				visible := p.Feed(ev.Text)
+				a.addTokens(EstimateTokens(ev.Text))
+				usage(false)
+				if tp, ok := p.Progress(); ok && tp.Name == "edit_file" {
+					hp := &ToolProgress{Name: tp.Name, Path: tp.Path, Lines: tp.Lines, Creating: tp.Creating}
+					if prog == nil || *prog != *hp {
+						prog = hp
+						emit(Event{Kind: EvToolProgress, Progress: hp})
+					}
+				}
+				if !show(visible) {
 					return res, ctx.Err()
 				}
 			case StreamEnd:
@@ -320,6 +366,7 @@ read:
 			}
 		}
 	}
+	usage(true)
 
 	if !ended {
 		return res, errors.New("the reply stream closed before the reply was finished")

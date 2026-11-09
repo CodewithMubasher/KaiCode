@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +19,7 @@ import (
 	"kai/internal/config"
 	"kai/internal/harness"
 	"kai/internal/tools"
+	"kai/internal/ui/components"
 )
 
 // kaiSystem is the instruction block sent with the first message of a chat.
@@ -35,6 +38,7 @@ type runState struct {
 	cancel  context.CancelFunc
 	id      int       // bumps on every start and stop, so late events can be ignored
 	thinkAt time.Time // when the model started thinking
+	tokens  int       // what the provider's context holds (from EvUsage)
 }
 
 // agentMsg carries one harness event to Update. agentDoneMsg means the
@@ -164,14 +168,26 @@ func (m Model) applyEvent(ev harness.Event) Model {
 		if m.run.thinkAt.IsZero() {
 			m.run.thinkAt = time.Now()
 		}
+		m.chat = m.chat.EndWrite() // reasoning after a call block: the call is done
 		m.chat = m.chat.StreamThinking(ev.Text)
 
 	case harness.EvText:
 		m = m.endThinking()
+		m.chat = m.chat.EndWrite()
 		m.chat = m.chat.StreamAnswer(ev.Text)
+
+	case harness.EvUsage:
+		m.run.tokens = ev.Tokens
+
+	case harness.EvToolProgress:
+		if ev.Progress != nil {
+			m = m.endThinking()
+			m.chat = m.chat.WriteProgress(ev.Progress.Name, ev.Progress.Path, ev.Progress.Lines, ev.Progress.Creating)
+		}
 
 	case harness.EvToolCall:
 		m = m.endThinking()
+		m.chat = m.chat.EndWrite()
 		m.chat = m.chat.DemoteAnswer() // text before a tool call was narration
 		if ev.Call != nil && ev.Call.Name == "read_file" {
 			path, _ := ev.Call.Args["path"].(string)
@@ -181,6 +197,12 @@ func (m Model) applyEvent(ev harness.Event) Model {
 	case harness.EvToolResult:
 		if ev.Call == nil || ev.Result == nil {
 			break
+		}
+		if ev.Call.Name == "edit_file" && !ev.Result.IsError {
+			if path, create, diff, ok := editDisplay(*ev.Call, ev.Result); ok {
+				m.chat = m.chat.EditFile(path, create, diff)
+				break
+			}
 		}
 		// A successful read_file is already on screen from its call.
 		if ev.Call.Name != "read_file" || ev.Result.IsError {
@@ -193,6 +215,7 @@ func (m Model) applyEvent(ev harness.Event) Model {
 
 	case harness.EvDone:
 		m = m.endThinking()
+		m.chat = m.chat.EndWrite()
 		m.chat = m.chat.EndAnswer()
 
 	case harness.EvError:
@@ -216,6 +239,55 @@ func (m Model) endThinking() Model {
 	}
 	m.chat = m.chat.EndThinking(took)
 	return m
+}
+
+// maxDiffLines caps an edit card, so writing a large file cannot flood the
+// chat. The rest is summarised in one row.
+const maxDiffLines = 60
+
+var firstLineRe = regexp.MustCompile(`first at line (\d+)`)
+
+// editDisplay turns an edit_file call into the diff card the chat shows. The
+// call arguments are the full text the model wrote, so creating a file shows
+// every added line and an edit shows the removed and added blocks.
+func editDisplay(c tools.Call, res *tools.Result) (path string, create bool, diff []components.DiffLine, ok bool) {
+	path, _ = tools.StringArg(c.Args, "path")
+	if strings.TrimSpace(path) == "" {
+		return "", false, nil, false
+	}
+	oldS, _ := tools.StringArg(c.Args, "old_string")
+	newS, _ := tools.StringArg(c.Args, "new_string")
+	create = strings.TrimSpace(oldS) == ""
+
+	start := 1
+	if !create {
+		if m := firstLineRe.FindStringSubmatch(res.Output); m != nil {
+			if n, err := strconv.Atoi(m[1]); err == nil && n > 0 {
+				start = n
+			}
+		}
+		for _, l := range textLines(oldS) {
+			diff = append(diff, components.DiffLine{Kind: components.DiffDel, Num: start, Text: l})
+			start++
+		}
+	}
+	for _, l := range textLines(newS) {
+		diff = append(diff, components.DiffLine{Kind: components.DiffAdd, Num: start, Text: l})
+		start++
+	}
+	if len(diff) > maxDiffLines {
+		more := len(diff) - maxDiffLines
+		diff = append(diff[:maxDiffLines], components.DiffLine{Text: fmt.Sprintf("… %d more lines", more)})
+	}
+	return path, create, diff, true
+}
+
+// textLines splits text into lines, ignoring the trailing newline.
+func textLines(s string) []string {
+	if s == "" {
+		return nil
+	}
+	return strings.Split(strings.TrimSuffix(strings.ReplaceAll(s, "\r\n", "\n"), "\n"), "\n")
 }
 
 // callLabel is a one-line description of a tool call for the screen: the

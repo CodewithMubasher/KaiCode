@@ -144,7 +144,7 @@ func (f *fakeStream) step(c components.ChatModel) components.ChatModel {
 		case fakeShell:
 			c = c.RunShell(it.text, it.out)
 		case fakeEdit:
-			c = c.EditFile(it.text, it.diff)
+			c = c.EditFile(it.text, false, it.diff)
 		}
 		f.idx++
 		f.pos = 0
