@@ -20,8 +20,13 @@ import (
 )
 
 // kaiSystem is the instruction block sent with the first message of a chat.
-const kaiSystem = "You are Kai, a coding agent working in the user's project directory. " +
-	"Use the tools to look at files before answering questions about them. Keep answers short and concrete."
+func kaiSystem() string {
+	return "You are Kai, a coding agent working in the user's project directory.\n\n" + tools.SystemGuide()
+}
+
+// toolTimeout is how long one tool call may run. The shell tool enforces its
+// own, shorter default (60 s) and accepts up to 10 minutes per call.
+const toolTimeout = 11 * time.Minute
 
 // runState is the agent and the request currently in flight.
 type runState struct {
@@ -35,7 +40,7 @@ type runState struct {
 // agentMsg carries one harness event to Update. agentDoneMsg means the
 // harness closed its channel.
 type (
-	agentMsg     struct {
+	agentMsg struct {
 		id int
 		ev harness.Event
 	}
@@ -47,6 +52,8 @@ type (
 func newRunState(cfg *config.Config) runState {
 	reg := tools.NewRegistry()
 	reg.Register(tools.ReadFile{})
+	reg.Register(tools.Shell{})
+	reg.Register(tools.EditFile{})
 
 	var provider harness.Provider
 	if cfg.Provider.Name == "mock" {
@@ -56,26 +63,25 @@ func newRunState(cfg *config.Config) runState {
 	}
 
 	return runState{agent: harness.New(harness.Config{
-		Provider: provider,
-		Tools:    reg,
-		System:   kaiSystem,
-		Record:   sessionLogger(cfg.Session.Dir),
+		Provider:    provider,
+		Tools:       reg,
+		System:      kaiSystem(),
+		ToolTimeout: toolTimeout,
+		Record:      sessionLogger(cfg.Session.Dir),
 	})}
 }
 
-// startBridge opens the local port the Chrome extension connects to. If that
-// fails, every send reports why instead of the app refusing to start.
+// startBridge opens the local port the Chrome extension connects to. There is
+// nothing to configure on the extension side. If this fails, every send
+// reports why instead of the app refusing to start.
 func startBridge(cfg *config.Config) harness.Provider {
 	addr := cfg.Provider.Addr
 	if addr == "" {
 		addr = "127.0.0.1:8765"
 	}
-	token, err := bridge.LoadOrCreateToken(config.KaiDir())
+	srv, err := bridge.Start(addr, slog.Default())
 	if err != nil {
-		return brokenProvider{fmt.Errorf("bridge token: %w", err)}
-	}
-	srv, err := bridge.Start(addr, token, slog.Default())
-	if err != nil {
+		slog.Error("could not start the bridge", "addr", addr, "err", err)
 		return brokenProvider{fmt.Errorf("could not start the bridge on %s (is another Kai running?): %w", addr, err)}
 	}
 	return srv
@@ -194,6 +200,9 @@ func (m Model) applyEvent(ev harness.Event) Model {
 		if ev.Err != nil {
 			msg = ev.Err.Error()
 		}
+		if m.cfg != nil && m.cfg.Log.File != "" {
+			msg += "  (log: " + m.cfg.Log.File + ")"
+		}
 		m.chat = m.chat.Fail(msg)
 	}
 	return m
@@ -209,14 +218,33 @@ func (m Model) endThinking() Model {
 	return m
 }
 
-// callLabel is a one-line "name {args}" for a tool call.
+// callLabel is a one-line description of a tool call for the screen: the
+// command for shell, "edit <path>" for edit_file, "name {args}" otherwise.
 func callLabel(c tools.Call) string {
+	switch c.Name {
+	case "shell":
+		if cmd, _ := c.Args["command"].(string); strings.TrimSpace(cmd) != "" {
+			return clipLine(cmd)
+		}
+	case "edit_file":
+		if p, _ := c.Args["path"].(string); p != "" {
+			if old, _ := c.Args["old_string"].(string); old == "" {
+				return clipLine("create " + p)
+			}
+			return clipLine("edit " + p)
+		}
+	}
 	args, _ := json.Marshal(c.Args)
 	s := c.Name
 	if len(c.Args) > 0 {
 		s += " " + string(args)
 	}
-	s = strings.ReplaceAll(s, "\n", " ")
+	return clipLine(s)
+}
+
+// clipLine puts s on one line and cuts it to 100 characters.
+func clipLine(s string) string {
+	s = strings.TrimSpace(strings.NewReplacer("\r\n", " ", "\n", " ", "\t", " ").Replace(s))
 	if r := []rune(s); len(r) > 100 {
 		s = string(r[:100]) + "…"
 	}

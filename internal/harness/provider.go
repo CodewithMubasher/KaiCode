@@ -14,8 +14,10 @@ var ErrChatLost = errors.New("the web chat was lost")
 // Turn is one message sent to the model.
 type Turn struct {
 	Prompt   string
-	ParentID *int // id of the model's previous reply; nil for the first message of a chat
-	Thinking bool // ask for extended reasoning
+	ParentID *int   // id of the model's previous reply; nil for the first message of a chat
+	Thinking bool   // ask for extended reasoning
+	Session  string // identifies the TUI session; one session = one web chat
+	NewChat  bool   // true for the first message of a session: open a fresh web chat
 }
 
 // StreamKind is the type of a StreamEvent.
@@ -28,6 +30,7 @@ const (
 	StreamTitle                      // the chat got a title
 	StreamEnd                        // the reply is complete; Text is the status ("FINISHED")
 	StreamError                      // the stream failed; Err says why
+	StreamSent                       // the prompt reached the web chat (the chat now exists)
 )
 
 // StreamEvent is one piece of a streamed model reply.

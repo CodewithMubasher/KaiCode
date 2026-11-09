@@ -80,6 +80,15 @@ func (p *Parser) drain(final bool) string {
 			continue
 		}
 
+		// An invoke with no wrapper around it: the call block starts here
+		// and runs to the end of the reply.
+		if loc := bareInvokeRe.FindStringIndex(p.buf); loc != nil {
+			out.WriteString(clean(p.buf[:loc[0]]))
+			p.buf = p.buf[loc[0]:]
+			p.inCalls = true
+			continue
+		}
+
 		// No marker yet. Release everything except a tail that could still
 		// grow into one.
 		keep := 0
@@ -106,6 +115,9 @@ func partialTail(s string) int {
 		return 0
 	}
 	if len(tail) > 1 {
+		if !utf8.FullRuneInString(tail[1:]) {
+			return len(tail) // half of a multi-byte character such as "｜": wait for the rest
+		}
 		r, _ := utf8.DecodeRuneInString(tail[1:])
 		if r != '|' && r != '｜' {
 			return 0

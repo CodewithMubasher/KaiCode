@@ -1,14 +1,16 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/spf13/cobra"
 
-	"kai/internal/bridge"
 	"kai/internal/config"
 	"kai/internal/logging"
 	"kai/internal/ui"
@@ -20,16 +22,19 @@ var (
 	logLevel string
 )
 
+func configPath() string {
+	if cfgPath != "" {
+		return cfgPath
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".kai", "config.toml")
+}
+
 var rootCmd = &cobra.Command{
 	Use:   "kai",
 	Short: "Kai Code — DeepSeek WebChat agent harness",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		home, _ := os.UserHomeDir()
-		if cfgPath == "" {
-			cfgPath = filepath.Join(home, ".kai", "config.toml")
-		}
-
-		cfg, err := config.Load(cfgPath)
+		cfg, err := config.Load(configPath())
 		if err != nil {
 			return fmt.Errorf("load config: %w", err)
 		}
@@ -42,13 +47,22 @@ var rootCmd = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("setup logging: %w", err)
 		}
-		logger.Info("kai starting", "version", version.Version)
+		logger.Info("kai starting", "version", version.Version, "os", runtime.GOOS, "arch", runtime.GOARCH,
+			"provider", cfg.Provider.Name, "addr", cfg.Provider.Addr, "config", configPath(), "log", cfg.Log.File)
+
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error("kai panicked", "panic", fmt.Sprint(r), "stack", string(debug.Stack()))
+				panic(r)
+			}
+		}()
 
 		p := tea.NewProgram(ui.NewModel(cfg))
 		if _, err := p.Run(); err != nil {
 			logger.Error("tui crashed", "err", err)
 			return err
 		}
+		logger.Info("kai exited")
 		return nil
 	},
 }
@@ -61,25 +75,36 @@ var versionCmd = &cobra.Command{
 	},
 }
 
-var tokenCmd = &cobra.Command{
-	Use:   "token",
-	Short: "Print the bridge address and token to paste into the Chrome extension",
+var logsLines int
+
+// logsCmd prints where logs.txt is and its last lines, to paste into a bug report.
+var logsCmd = &cobra.Command{
+	Use:   "logs",
+	Short: "Print the path of logs.txt and its last lines",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		home, _ := os.UserHomeDir()
-		path := cfgPath
-		if path == "" {
-			path = filepath.Join(home, ".kai", "config.toml")
-		}
-		cfg, err := config.Load(path)
+		cfg, err := config.Load(configPath())
 		if err != nil {
 			return fmt.Errorf("load config: %w", err)
 		}
-		token, err := bridge.LoadOrCreateToken(config.KaiDir())
+		fmt.Println("Log file:", cfg.Log.File)
+		f, err := os.Open(cfg.Log.File)
 		if err != nil {
-			return err
+			fmt.Println("(no log yet: run kai first)")
+			return nil
 		}
-		fmt.Println("Address: http://" + cfg.Provider.Addr)
-		fmt.Println("Token:   " + token)
+		defer f.Close()
+		var ring []string
+		sc := bufio.NewScanner(f)
+		sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+		for sc.Scan() {
+			ring = append(ring, sc.Text())
+			if len(ring) > logsLines {
+				ring = ring[1:]
+			}
+		}
+		for _, l := range ring {
+			fmt.Println(l)
+		}
 		return nil
 	},
 }
@@ -87,8 +112,9 @@ var tokenCmd = &cobra.Command{
 func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgPath, "config", "", "config file path")
 	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", "", "log level (debug/info/warn/error)")
+	logsCmd.Flags().IntVarP(&logsLines, "lines", "n", 60, "how many lines to show")
 	rootCmd.AddCommand(versionCmd)
-	rootCmd.AddCommand(tokenCmd)
+	rootCmd.AddCommand(logsCmd)
 }
 
 func main() {

@@ -17,11 +17,9 @@ import (
 	"kai/internal/harness/provider/deepseek"
 )
 
-const token = "secret"
-
 func newTestServer(t *testing.T) (*Server, *httptest.Server) {
 	t.Helper()
-	s := NewServer(token, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	s := NewServer(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	ts := httptest.NewServer(s.Handler())
 	t.Cleanup(ts.Close)
 	return s, ts
@@ -33,7 +31,7 @@ func do(t *testing.T, method, url, body string, hdr map[string]string) *http.Res
 	if err != nil {
 		t.Fatal(err)
 	}
-	req.Header.Set("X-Kai-Token", token)
+	req.Header.Set(ClientHeader, "test")
 	for k, v := range hdr {
 		req.Header.Set(k, v)
 	}
@@ -97,12 +95,12 @@ func TestRoundTrip(t *testing.T) {
 	go func() { cmdCh <- poll(t, ts.URL) }()
 	waitConnected(t, s)
 
-	evCh, err := s.Send(context.Background(), harness.Turn{Prompt: "hello"})
+	evCh, err := s.Send(context.Background(), harness.Turn{Prompt: "hello", NewChat: true, Session: "s1"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	cmd := <-cmdCh
-	if cmd.Type != "send" || cmd.Prompt != "hello" || !cmd.NewChat || cmd.ID == "" {
+	if cmd.Type != "send" || cmd.Prompt != "hello" || !cmd.NewChat || cmd.Session != "s1" || cmd.ID == "" {
 		t.Fatalf("command = %+v", cmd)
 	}
 
@@ -132,8 +130,7 @@ func TestContinuingAChatDoesNotAskForANewOne(t *testing.T) {
 	go func() { cmdCh <- poll(t, ts.URL) }()
 	waitConnected(t, s)
 
-	parent := 2
-	if _, err := s.Send(context.Background(), harness.Turn{Prompt: "more", ParentID: &parent}); err != nil {
+	if _, err := s.Send(context.Background(), harness.Turn{Prompt: "more", Session: "s1"}); err != nil {
 		t.Fatal(err)
 	}
 	if cmd := <-cmdCh; cmd.NewChat {
@@ -206,9 +203,14 @@ func TestNotConnected(t *testing.T) {
 func TestGuard(t *testing.T) {
 	_, ts := newTestServer(t)
 
-	resp := do(t, "GET", ts.URL+"/v1/status", "", map[string]string{"X-Kai-Token": "wrong"})
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Errorf("bad token: status %d", resp.StatusCode)
+	// no client header
+	req, _ := http.NewRequest("GET", ts.URL+"/v1/status", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("no client header: status %d", resp.StatusCode)
 	}
 	resp.Body.Close()
 
@@ -230,14 +232,46 @@ func TestGuard(t *testing.T) {
 	}
 }
 
-func TestLoadOrCreateTokenIsStable(t *testing.T) {
-	dir := t.TempDir()
-	a, err := LoadOrCreateToken(dir)
-	if err != nil || len(a) < 32 {
-		t.Fatalf("token = %q, err = %v", a, err)
+func TestSentIsReportedBeforeAnyReply(t *testing.T) {
+	s, ts := newTestServer(t)
+	cmdCh := make(chan Command, 1)
+	go func() { cmdCh <- poll(t, ts.URL) }()
+	waitConnected(t, s)
+
+	evCh, err := s.Send(context.Background(), harness.Turn{Prompt: "x", NewChat: true, Session: "s1"})
+	if err != nil {
+		t.Fatal(err)
 	}
-	b, _ := LoadOrCreateToken(dir)
-	if a != b {
-		t.Error("the token must not change between runs")
+	cmd := <-cmdCh
+	sendEvent(t, ts.URL, event{ID: cmd.ID, Type: "accepted"})
+	sendEvent(t, ts.URL, event{ID: cmd.ID, Type: "sent"})
+	// the reply never arrives: the browser reports an error instead
+	sendEvent(t, ts.URL, event{ID: cmd.ID, Type: "error", Message: "boom"})
+
+	evs := collect(t, evCh)
+	sawSent := false
+	for _, e := range evs {
+		if e.Kind == harness.StreamSent {
+			sawSent = true
+		}
+	}
+	if !sawSent {
+		t.Errorf("no StreamSent in %+v", evs)
+	}
+}
+
+func TestExtensionLogsLandInTheLog(t *testing.T) {
+	var buf bytes.Buffer
+	s := NewServer(slog.New(slog.NewTextHandler(&buf, nil)))
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+
+	resp := do(t, "POST", ts.URL+"/v1/log", `{"lines":[{"t":1,"src":"page","lvl":"warn","msg":"input box not found"}]}`, nil)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	if !strings.Contains(buf.String(), "input box not found") {
+		t.Errorf("log = %q", buf.String())
 	}
 }

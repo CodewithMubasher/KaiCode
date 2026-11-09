@@ -8,8 +8,10 @@
 //
 //	GET  /v1/poll    long-poll: the extension asks for its next command
 //	POST /v1/event   the extension reports raw SSE chunks, the end, or an error
+//	POST /v1/log     the extension's own log lines, merged into logs.txt
 //	GET  /v1/status  is an extension polling?
 //
-// Every request must carry the shared token in X-Kai-Token, and a browser
-// Origin, if present, must be chrome-extension://.
+// There is no token to configure. The server only answers on localhost, a
+// browser Origin, if present, must be chrome-extension://, and every request
+// must carry the X-Kai-Client header (which web pages cannot add).
 package bridge

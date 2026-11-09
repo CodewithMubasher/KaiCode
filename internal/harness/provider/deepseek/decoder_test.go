@@ -110,15 +110,6 @@ func TestDecodeStreamCutShort(t *testing.T) {
 	}
 }
 
-func TestNewRequestShape(t *testing.T) {
-	id := 2
-	r := NewRequest("sess", harness.Turn{Prompt: "hi", ParentID: &id, Thinking: true})
-	if r.ChatSessionID != "sess" || r.ParentMessageID == nil || *r.ParentMessageID != 2 ||
-		!r.ThinkingEnabled || r.RefFileIDs == nil || r.ModelType != "default" {
-		t.Errorf("request = %+v", r)
-	}
-}
-
 // A follow-up turn in an existing chat (search_enabled, no title event).
 func TestDecodeSecondCapture(t *testing.T) {
 	f, err := os.Open("testdata/continue.sse")

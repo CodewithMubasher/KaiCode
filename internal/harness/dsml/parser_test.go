@@ -1,6 +1,7 @@
 package dsml
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -161,5 +162,102 @@ func TestFirstPromptHasInstructionsToolsAndRequest(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("prompt is missing %q", want)
 		}
+	}
+}
+
+// The model's actual reply that leaked into the TUI: a BOM, blank lines, double
+// full-width bars, a space after the bars, and the wrapper named just "calls".
+const leaked = "\ufeff\n\n<｜｜DSML｜｜ calls>\n" +
+	"<｜｜DSML｜｜ invoke name=\"shell\">\n" +
+	"<｜｜DSML｜｜ parameter name=\"command\" string=\"true\">go version</｜｜DSML｜｜ parameter>\n" +
+	"</｜｜DSML｜｜ invoke>\n" +
+	"</｜｜DSML｜｜ calls>"
+
+func TestParseTheLeakedReply(t *testing.T) {
+	text, calls, warns := Parse(leaked)
+	if len(calls) != 1 || calls[0].Name != "shell" || calls[0].Args["command"] != "go version" {
+		t.Fatalf("calls = %#v warns = %v", calls, warns)
+	}
+	if len(warns) != 0 {
+		t.Errorf("warns = %v", warns)
+	}
+	if strings.TrimSpace(text) != "" {
+		t.Errorf("markup leaked into the visible text: %q", text)
+	}
+}
+
+func TestParseTheLeakedReplyAnyChunking(t *testing.T) {
+	check := func(name, text string, chunks []string) {
+		t.Helper()
+		p := NewParser()
+		var visible string
+		for _, c := range chunks {
+			visible += p.Feed(c)
+		}
+		visible += p.Finish()
+		if len(p.Calls()) != 1 || p.Calls()[0].Args["command"] != "go version" {
+			t.Fatalf("%s: calls = %#v", name, p.Calls())
+		}
+		if strings.TrimSpace(visible) != "" {
+			t.Fatalf("%s leaked %q", name, visible)
+		}
+	}
+
+	// Whole characters per chunk, as the stream delivers them.
+	runes := []rune(leaked)
+	for size := 1; size <= len(runes); size++ {
+		var chunks []string
+		for i := 0; i < len(runes); i += size {
+			chunks = append(chunks, string(runes[i:min(i+size, len(runes))]))
+		}
+		check(fmt.Sprintf("%d runes per chunk", size), leaked, chunks)
+	}
+
+	// Even single bytes, splitting the multi-byte bars, must not break the tag.
+	body := strings.TrimPrefix(leaked, "\ufeff")
+	for size := 1; size <= len(body); size++ {
+		var chunks []string
+		for i := 0; i < len(body); i += size {
+			chunks = append(chunks, body[i:min(i+size, len(body))])
+		}
+		check(fmt.Sprintf("%d bytes per chunk", size), body, chunks)
+	}
+}
+
+func TestParseMarkupVariants(t *testing.T) {
+	inner := `<|DSML|invoke name="shell"><|DSML|parameter name="command" string="true">ls</|DSML|parameter></|DSML|invoke>`
+	cases := map[string]string{
+		"calls wrapper":        `<|DSML|calls>` + inner + `</|DSML|calls>`,
+		"tool call singular":   `<|DSML|tool_call>` + inner + `</|DSML|tool_call>`,
+		"space in wrapper":     `<|DSML|tool calls>` + inner + `</|DSML|tool calls>`,
+		"double ascii bars":    `<||DSML||tool_calls>` + inner + `</||DSML||tool_calls>`,
+		"spaces after bars":    `<| DSML | tool_calls >` + inner + `</| DSML | tool_calls >`,
+		"upper case":           `<|DSML|TOOL_CALLS>` + inner + `</|DSML|TOOL_CALLS>`,
+		"no wrapper at all":    inner,
+		"no wrapper, 2 bars":   strings.NewReplacer("|", "｜｜").Replace(inner),
+		"text before, no wrap": "Checking.\n" + inner,
+	}
+	for name, in := range cases {
+		text, calls, _ := Parse(in)
+		if len(calls) != 1 || calls[0].Name != "shell" || calls[0].Args["command"] != "ls" {
+			t.Errorf("%s: calls = %#v", name, calls)
+		}
+		if strings.Contains(text, "DSML") || strings.Contains(text, "invoke") {
+			t.Errorf("%s: markup leaked: %q", name, text)
+		}
+	}
+}
+
+func TestBareInvokeKeepsTheTextBefore(t *testing.T) {
+	text, calls, _ := Parse("Let me check.\n" + `<|DSML|invoke name="a"></|DSML|invoke>`)
+	if text != "Let me check.\n" || len(calls) != 1 {
+		t.Errorf("text = %q calls = %#v", text, calls)
+	}
+}
+
+func TestByteOrderMarkIsDropped(t *testing.T) {
+	text, _, _ := Parse("\ufeffhello")
+	if text != "hello" {
+		t.Errorf("text = %q", text)
 	}
 }

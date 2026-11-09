@@ -21,6 +21,7 @@ Rules:
 - Use string="true" for plain text values (write them as-is, no escaping). Use string="false" for numbers, booleans, arrays and objects (write valid JSON).
 - You may put several invoke entries in one block; they run in order.
 - Write nothing after </|DSML|tool_calls>. Stop and wait: the results arrive in the next message, each inside <tool_result> tags, in the same order as your calls.
+- Copy the tags exactly as shown: ASCII "|" bars, one on each side of DSML, and the wrapper name tool_calls.
 - Only use the tools and parameters defined below.
 - When the task is finished, reply normally without a tool_calls block.
 

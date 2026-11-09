@@ -5,23 +5,37 @@ into a chat.deepseek.com tab and reads the reply from the page's own stream,
 so DeepSeek's login, proof-of-work and cookies keep working exactly as they do
 for you. Nothing leaves your machine except the usual traffic to DeepSeek.
 
-## Set up
+## Set up (no token, no copy-paste)
 
 1. `chrome://extensions` → turn on **Developer mode** → **Load unpacked** → pick this `extension` folder.
-2. In a terminal run `kai token`. It prints the address and a secret token.
-3. Click the extension icon, paste both, **Save**. It should say *Connected to Kai* once `kai` is running.
-4. Open https://chat.deepseek.com and log in. Reload the tab if it was open before you installed the extension.
-5. Set the page's DeepThink / Search toggles the way you want; Kai does not change them.
-6. Run `kai` and send a message.
+   (Updating from an older version? Click the reload icon on the extension card.)
+2. Open https://chat.deepseek.com and log in. A tab that was already open is picked up automatically.
+3. Run `kai`. The extension popup says *Connected to Kai*.
+
+Set the page's DeepThink / Search toggles the way you want; Kai does not change them.
+
+## How a Kai session maps to a web chat
+
+- A new Kai session (start of `kai`, `/new`, `/clear`, ctrl+n) opens a **new chat** in the tab and sends Kai's instructions **once**.
+- Every later message of that session goes into the **same chat**, with only the new text. DeepSeek keeps the history itself.
+- If you wander off to another chat in that tab, Kai navigates back to its own chat before the next message.
+- If the chat is gone (tab closed before it had an address), Kai starts a new chat and replays a short recap.
+
+## If something does not work
+
+- Click the extension icon → **Self-test**. It checks Kai, the tab, the page hook and the input box.
+- Everything is logged. Kai writes `~/.kai/logs.txt` (Windows: `C:\Users\<you>\.kai\logs.txt`) and the extension's lines go into the same file while Kai runs.
+  `kai logs` prints the path and the last lines. The popup also has **Download logs.txt** for the extension's own log.
+- The log shows each step of a message: queued → accepted by the extension → delivered to DeepSeek → first reply data → done.
+  The error in Kai tells you which step stalled.
 
 ## How it works
 
-- `inject.js` (page context) wraps `fetch`; after Kai sends a message it copies the `/api/v0/chat/completion` stream and passes the raw SSE text on.
+- `inject.js` (page context) wraps `fetch` (and XHR as a fallback); after Kai sends a message it copies the `/api/v0/chat/completion` stream and passes the raw SSE text on.
 - `content.js` types the prompt into the chat box and presses Enter (falls back to the send button).
-- `background.js` long-polls `http://127.0.0.1:8765/v1/poll` for commands and POSTs the SSE chunks back to `/v1/event`. Every request carries your token.
+- `background.js` long-polls `http://127.0.0.1:8765/v1/poll` for commands and POSTs the SSE chunks and log lines back. The bridge only listens on localhost and rejects web pages.
 
 ## Known limits
 
 - Selectors are heuristic (the chat is a `<textarea>`, Enter sends). If DeepSeek changes its page, `content.js` is the only file to touch.
 - Stopping a reply in Kai stops relaying it; the page may keep generating until it finishes.
-- A "new chat" navigates the Kai tab to chat.deepseek.com. Do not use that tab while Kai is working.

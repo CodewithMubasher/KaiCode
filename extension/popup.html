@@ -1,20 +1,31 @@
 <!doctype html>
 <meta charset="utf-8" />
 <style>
-  body { font: 13px system-ui, sans-serif; width: 300px; margin: 12px; }
-  label { display: block; margin: 8px 0 2px; color: #555; }
-  input { width: 100%; box-sizing: border-box; padding: 5px; }
-  button { margin-top: 10px; padding: 5px 12px; }
-  #state { margin-top: 10px; font-weight: 600; }
+  body { font: 13px system-ui, sans-serif; width: 320px; margin: 12px; }
+  h3 { margin: 0 0 6px; }
+  #state { font-weight: 600; margin-bottom: 8px; }
   .ok { color: #1a7f5a; } .bad { color: #b3261e; }
+  button { margin: 4px 4px 0 0; padding: 5px 10px; }
+  #test { white-space: pre-wrap; font: 12px ui-monospace, monospace; margin-top: 8px; }
   small { color: #777; display: block; margin-top: 8px; }
+  details { margin-top: 10px; }
+  input { width: 100%; box-sizing: border-box; padding: 5px; margin-top: 4px; }
 </style>
-<h3 style="margin:0 0 6px">Kai Bridge</h3>
-<label for="addr">Kai address</label>
-<input id="addr" placeholder="http://127.0.0.1:8765" />
-<label for="token">Token (run <code>kai token</code>)</label>
-<input id="token" type="password" />
-<button id="save">Save</button>
+<h3>Kai Bridge</h3>
 <div id="state">…</div>
-<small>Keep a logged-in chat.deepseek.com tab open. Kai reuses that tab.</small>
+<div>
+  <button id="selftest">Self-test</button>
+  <button id="download">Download logs.txt</button>
+  <button id="copy">Copy logs</button>
+</div>
+<div id="test"></div>
+<small>Nothing to set up: keep a logged-in chat.deepseek.com tab open and run <code>kai</code>.
+Kai also writes everything to <code>~/.kai/logs.txt</code>.</small>
+<details>
+  <summary>Advanced</summary>
+  <label for="addr">Kai address (only if you changed it in config.toml)</label>
+  <input id="addr" placeholder="http://127.0.0.1:8765" />
+  <button id="save">Save</button>
+  <button id="clear">Clear logs</button>
+</details>
 <script src="popup.js"></script>

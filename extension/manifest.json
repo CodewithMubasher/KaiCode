@@ -1,10 +1,10 @@
 {
   "manifest_version": 3,
   "name": "Kai Bridge",
-  "version": "0.1.0",
-  "description": "Connects the Kai terminal agent to your DeepSeek web chat.",
+  "version": "0.2.0",
+  "description": "Connects the Kai terminal agent to your DeepSeek web chat. Install it, open chat.deepseek.com, run kai.",
   "minimum_chrome_version": "116",
-  "permissions": ["storage", "tabs", "alarms"],
+  "permissions": ["storage", "tabs", "alarms", "scripting"],
   "host_permissions": [
     "https://chat.deepseek.com/*",
     "http://127.0.0.1/*",

@@ -363,3 +363,67 @@ func TestFailedFirstSendKeepsInstructionsForTheNextTry(t *testing.T) {
 		t.Fatalf("prompts = %q", prompts)
 	}
 }
+
+// sentOnly mimics a bridge where the prompt reaches the web chat but the
+// reply stream never makes it back to Kai (no "ready" event, then an error).
+type sentOnly struct {
+	turns []Turn
+}
+
+func (s *sentOnly) Send(ctx context.Context, t Turn) (<-chan StreamEvent, error) {
+	s.turns = append(s.turns, t)
+	ch := make(chan StreamEvent, 2)
+	ch <- StreamEvent{Kind: StreamSent}
+	ch <- StreamEvent{Kind: StreamError, Err: errors.New("no reply reached Kai")}
+	close(ch)
+	return ch, nil
+}
+
+// Regression: when the reply never arrives, the web chat still exists and
+// holds Kai's instructions. The next message must continue that chat (same
+// session, newChat=false) and must not send the instructions again.
+func TestDeliveredPromptCountsEvenIfTheReplyIsLost(t *testing.T) {
+	p := &sentOnly{}
+	a := New(Config{Provider: p, System: "sys-instructions"})
+
+	drain(t, a.Run(context.Background(), "first"))
+	drain(t, a.Run(context.Background(), "second"))
+
+	if len(p.turns) != 2 {
+		t.Fatalf("sends = %d, want 2", len(p.turns))
+	}
+	first, second := p.turns[0], p.turns[1]
+	if !first.NewChat || second.NewChat {
+		t.Errorf("newChat = %v then %v, want true then false", first.NewChat, second.NewChat)
+	}
+	if first.Session == "" || first.Session != second.Session {
+		t.Errorf("sessions = %q then %q, want the same non-empty id", first.Session, second.Session)
+	}
+	if !strings.Contains(first.Prompt, "sys-instructions") {
+		t.Errorf("first prompt lacks the instructions: %q", first.Prompt)
+	}
+	if strings.Contains(second.Prompt, "sys-instructions") || strings.Contains(second.Prompt, "<kai_instructions>") {
+		t.Errorf("second prompt repeats the instructions: %q", second.Prompt)
+	}
+}
+
+// Reset (new TUI session) must open a new web chat with a new session id and
+// send the instructions again, once.
+func TestResetStartsANewChatAndSession(t *testing.T) {
+	p := &sentOnly{}
+	a := New(Config{Provider: p, System: "sys-instructions"})
+
+	drain(t, a.Run(context.Background(), "one"))
+	a.Reset(context.Background())
+	drain(t, a.Run(context.Background(), "two"))
+
+	if len(p.turns) != 2 {
+		t.Fatalf("sends = %d, want 2", len(p.turns))
+	}
+	if !p.turns[1].NewChat || p.turns[0].Session == p.turns[1].Session {
+		t.Errorf("after Reset: newChat=%v, sessions %q vs %q", p.turns[1].NewChat, p.turns[0].Session, p.turns[1].Session)
+	}
+	if !strings.Contains(p.turns[1].Prompt, "sys-instructions") {
+		t.Errorf("the new chat did not get the instructions: %q", p.turns[1].Prompt)
+	}
+}

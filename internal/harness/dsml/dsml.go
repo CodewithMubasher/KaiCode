@@ -6,9 +6,11 @@
 //	</|DSML|invoke>
 //	</|DSML|tool_calls>
 //
-// The parser is deliberately forgiving: the outer wrapper may be tool_calls
-// (V4) or function_calls (V3.2), and the bars may be ASCII "|" or full-width
-// "｜".
+// The parser is deliberately forgiving, because the model does not always
+// spell the markup the way it was taught: the wrapper may be tool_calls (V4),
+// function_calls (V3.2) or just calls, or missing altogether; the bars may be
+// ASCII "|" or full-width "｜", one or several ("<｜｜DSML｜｜ calls>"); spaces
+// may follow the bars.
 package dsml
 
 import (
@@ -21,18 +23,20 @@ import (
 )
 
 const (
-	bar      = `[|｜]`
+	bar      = `[|｜]+`
 	pre      = `<` + bar + `\s*DSML\s*` + bar + `\s*`
 	closePre = `</` + bar + `\s*DSML\s*` + bar + `\s*`
-	wrapper  = `(?:tool_calls|function_calls)`
+	wrapper  = `(?:(?:tool|function)[_ ]?)?calls?`
 	quote    = `["']`
 )
 
 var (
-	openRe   = regexp.MustCompile(`(?i)` + pre + wrapper + `\s*>`)
-	closeRe  = regexp.MustCompile(`(?i)` + closePre + wrapper + `\s*>`)
-	invokeRe = regexp.MustCompile(`(?is)` + pre + `invoke\s+name\s*=\s*` + quote + `([^"']*)` + quote + `\s*>(.*?)` + closePre + `invoke\s*>`)
-	paramRe  = regexp.MustCompile(`(?is)` + pre + `parameter\s+name\s*=\s*` + quote + `([^"']*)` + quote +
+	openRe  = regexp.MustCompile(`(?i)` + pre + wrapper + `\s*>`)
+	closeRe = regexp.MustCompile(`(?i)` + closePre + wrapper + `\s*>`)
+	// A call block the model wrote without the outer wrapper.
+	bareInvokeRe = regexp.MustCompile(`(?i)` + pre + `invoke\s+name\s*=`)
+	invokeRe     = regexp.MustCompile(`(?is)` + pre + `invoke\s+name\s*=\s*` + quote + `([^"']*)` + quote + `\s*>(.*?)` + closePre + `invoke\s*>`)
+	paramRe      = regexp.MustCompile(`(?is)` + pre + `parameter\s+name\s*=\s*` + quote + `([^"']*)` + quote +
 		`(?:\s+string\s*=\s*` + quote + `(true|false)` + quote + `)?\s*>(.*?)` + closePre + `parameter\s*>`)
 
 	// <|end▁of▁sentence|> and friends: model control tokens that sometimes
@@ -40,7 +44,9 @@ var (
 	specialRe = regexp.MustCompile(`(?i)<` + bar + `\s*(?:begin|end)[▁_ ]?of[▁_ ]?sentence\s*` + bar + `>`)
 )
 
-func clean(s string) string { return specialRe.ReplaceAllString(s, "") }
+func clean(s string) string {
+	return specialRe.ReplaceAllString(strings.ReplaceAll(s, "\ufeff", ""), "")
+}
 
 // parseInvokes extracts every complete invoke from the body of a tool_calls
 // block. ids numbers the calls.

@@ -48,7 +48,7 @@ func Default() *Config {
 		UI:       UIConfig{Theme: "default", Mouse: false},
 		Provider: ProviderConfig{Name: "deepseek", Addr: "127.0.0.1:8765"},
 		Session:  SessionConfig{Dir: filepath.Join(kaiDir, "sessions")},
-		Log:      LogConfig{Level: "info", File: filepath.Join(kaiDir, "logs", "kai.log")},
+		Log:      LogConfig{Level: "debug", File: filepath.Join(kaiDir, "logs.txt")},
 	}
 }
 
@@ -62,6 +62,16 @@ func Load(path string) (*Config, error) {
 	}
 	if _, err := toml.DecodeFile(path, cfg); err != nil {
 		return nil, err
+	}
+	// Older configs point at logs/kai.log with level "info". Move them to the
+	// single logs.txt with full detail so problems can be analysed.
+	if cfg.Log.File == filepath.Join(KaiDir(), "logs", "kai.log") {
+		def := Default()
+		cfg.Log.File = def.Log.File
+		if cfg.Log.Level == "info" {
+			cfg.Log.Level = def.Log.Level
+		}
+		_ = Save(cfg, path)
 	}
 	return cfg, nil
 }

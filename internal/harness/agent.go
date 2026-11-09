@@ -2,8 +2,11 @@ package harness
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +41,7 @@ type Agent struct {
 	cfg Config
 
 	mu      sync.Mutex
+	session string // one TUI session = one web chat; changes on Reset or a lost chat
 	parent  *int
 	started bool   // the current web chat has been given Kai's instructions
 	recap   string // recap to put in front of the next first message, after a lost chat
@@ -57,14 +61,25 @@ func New(cfg Config) *Agent {
 	if cfg.ToolTimeout <= 0 {
 		cfg.ToolTimeout = 60 * time.Second
 	}
-	return &Agent{cfg: cfg}
+	return &Agent{cfg: cfg, session: newSessionID()}
+}
+
+func newSessionID() string {
+	b := make([]byte, 6)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("s%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
 }
 
 // Reset forgets the chat so the next Run starts a new one.
 func (a *Agent) Reset(ctx context.Context) {
 	a.mu.Lock()
 	a.parent, a.started, a.recap, a.history = nil, false, "", nil
+	a.session = newSessionID()
+	sess := a.session
 	a.mu.Unlock()
+	slog.Info("agent reset: next message opens a new web chat", "session", sess)
 	if s, ok := a.cfg.Provider.(Sessioner); ok {
 		_ = s.NewSession(ctx)
 	}
@@ -101,6 +116,28 @@ func (a *Agent) setParent(id int) {
 	a.started = true
 	a.recap = ""
 	a.mu.Unlock()
+}
+
+// markStarted is called as soon as the browser reports that the prompt was
+// delivered to the web chat. From then on the chat holds Kai's instructions,
+// even if the reply itself fails or never reaches Kai.
+func (a *Agent) markStarted() {
+	a.mu.Lock()
+	first := !a.started
+	a.started = true
+	a.recap = ""
+	sess := a.session
+	a.mu.Unlock()
+	if first {
+		slog.Info("web chat started: instructions sent once, later messages send only new content", "session", sess)
+	}
+}
+
+// chatState is what the next Turn needs to know.
+func (a *Agent) chatState() (parent *int, session string, newChat bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.parent, a.session, !a.started
 }
 
 // Run handles one user request. It streams Events and closes the channel when
@@ -144,7 +181,9 @@ func (a *Agent) restartChat() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.parent, a.started = nil, false
+	a.session = newSessionID()
 	a.recap = recap(a.history, recapBudget)
+	slog.Warn("web chat lost: starting a new chat with a recap", "session", a.session)
 }
 
 func (a *Agent) loop(ctx context.Context, user string, emit func(Event) bool) {
@@ -165,6 +204,7 @@ func (a *Agent) loop(ctx context.Context, user string, emit func(Event) bool) {
 			continue
 		}
 		if err != nil {
+			slog.Error("agent turn failed", "step", step, "err", err)
 			emit(Event{Kind: EvError, Err: err})
 			return
 		}
@@ -218,7 +258,15 @@ type turnResult struct {
 func (a *Agent) turn(ctx context.Context, prompt string, emit func(Event) bool) (turnResult, error) {
 	var res turnResult
 
-	stream, err := a.cfg.Provider.Send(ctx, Turn{Prompt: prompt, ParentID: a.parentID(), Thinking: a.cfg.Thinking})
+	parent, session, newChat := a.chatState()
+	slog.Info("agent turn", "session", session, "newChat", newChat, "hasParent", parent != nil, "promptBytes", len(prompt))
+	stream, err := a.cfg.Provider.Send(ctx, Turn{
+		Prompt:   prompt,
+		ParentID: parent,
+		Thinking: a.cfg.Thinking,
+		Session:  session,
+		NewChat:  newChat,
+	})
 	if err != nil {
 		return res, err
 	}
@@ -245,6 +293,8 @@ read:
 				break read
 			}
 			switch ev.Kind {
+			case StreamSent:
+				a.markStarted()
 			case StreamReady:
 				a.setParent(ev.MessageID)
 			case StreamThinking:

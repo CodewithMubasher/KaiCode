@@ -1,56 +1,146 @@
 // Service worker: long-polls Kai for commands, drives the DeepSeek tab, and
-// forwards the page's raw SSE back to Kai.
+// forwards the page's raw SSE back to Kai. No setup: the address is fixed and
+// there is no token.
 
 const DEFAULT_ADDR = 'http://127.0.0.1:8765';
 const FRESH_CHAT = 'https://chat.deepseek.com/';
+const DEEPSEEK = 'https://chat.deepseek.com/*';
+const HEADERS = { 'X-Kai-Client': 'kai-bridge' };
 
 let connected = false;
 let lastError = '';
 let polling = false;
-let lastTabId = null;
 const cancelled = new Set();
 const outbox = new Map();
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const errText = (e) => String((e && e.message) || e);
 
-async function settings() {
-  const s = await chrome.storage.local.get(['token', 'addr']);
-  return { token: (s.token || '').trim(), addr: (s.addr || DEFAULT_ADDR).replace(/\/+$/, '') };
+// ---- logging -----------------------------------------------------------------
+// Kept in memory, saved to chrome.storage (so it survives the worker being
+// suspended), downloadable from the popup, and shipped to Kai, which writes it
+// into logs.txt next to its own lines.
+
+const MAX_LOG = 1000;
+let logBuf = [];
+let pending = [];
+let dirty = false;
+
+const logsReady = chrome.storage.local.get('logs').then((s) => {
+  if (Array.isArray(s.logs)) logBuf = s.logs.concat(logBuf).slice(-MAX_LOG);
+});
+
+function log(level, msg, src = 'bg') {
+  const line = { t: Date.now(), src, lvl: level, msg: String(msg) };
+  logBuf.push(line);
+  if (logBuf.length > MAX_LOG) logBuf.shift();
+  pending.push(line);
+  if (pending.length > 300) pending.shift();
+  dirty = true;
 }
 
+const fmt = (l) => `${new Date(l.t).toISOString()} [${l.src}] ${l.lvl.toUpperCase()} ${l.msg}`;
+
+async function saveAndShip() {
+  if (dirty) {
+    dirty = false;
+    await logsReady;
+    chrome.storage.local.set({ logs: logBuf }).catch(() => {});
+  }
+  if (connected && pending.length) {
+    const batch = pending.splice(0, pending.length);
+    try {
+      const { addr } = await settings();
+      const r = await fetch(`${addr}/v1/log`, {
+        method: 'POST',
+        headers: { ...HEADERS, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ lines: batch }),
+      });
+      if (!r.ok) pending.unshift(...batch);
+    } catch (_) {
+      pending.unshift(...batch);
+    }
+  }
+}
+setInterval(saveAndShip, 1500);
+
+// ---- settings ----------------------------------------------------------------
+
+async function settings() {
+  const s = await chrome.storage.local.get(['addr']);
+  let addr = (s.addr || DEFAULT_ADDR).trim().replace(/\/+$/, '');
+  if (!/^https?:\/\//.test(addr)) addr = 'http://' + addr;
+  return { addr };
+}
+
+let lastStateKey = '';
 function setState(ok, error) {
   connected = ok;
   lastError = error || '';
   chrome.action.setBadgeText({ text: ok ? 'ON' : '' });
   chrome.action.setBadgeBackgroundColor({ color: '#1a7f5a' });
+  const key = ok ? 'ok' : 'bad:' + lastError;
+  if (key !== lastStateKey) {
+    lastStateKey = key;
+    log(ok ? 'info' : 'warn', ok ? 'connected to Kai' : `not connected to Kai: ${lastError}`);
+  }
 }
 
-// ---- talking to Kai ------------------------------------------------------
+// ---- the chat Kai owns ---------------------------------------------------------
+// One Kai session = one DeepSeek chat. We remember which, so every message of
+// the session lands in the same chat, and a new session opens a new one.
+
+let chat = { session: null, url: null, tabId: null };
+const chatLoaded = chrome.storage.session
+  .get('chat')
+  .catch(() => ({}))
+  .then((s) => {
+    if (s && s.chat) chat = s.chat;
+  });
+const persistChat = () => chrome.storage.session.set({ chat }).catch(() => {});
+
+const pathOf = (url) => {
+  try {
+    return new URL(url).pathname;
+  } catch (_) {
+    return '';
+  }
+};
+const isChatPath = (p) => p !== '/' && p !== '' && !/sign_in|sign_up|login|register/.test(p);
+
+// The first time the Kai tab moves to a real chat URL, that is the chat.
+function noteUrl(tabId, url) {
+  if (!chat.session || chat.url || tabId !== chat.tabId) return;
+  if (!isChatPath(pathOf(url))) return;
+  chat.url = url;
+  persistChat();
+  log('info', `this session's chat is ${url}`);
+}
+chrome.tabs.onUpdated.addListener((tabId, info) => {
+  if (info.url) noteUrl(tabId, info.url);
+});
+
+// ---- talking to Kai ------------------------------------------------------------
 
 async function pollLoop() {
   if (polling) return;
   polling = true;
   try {
     for (;;) {
-      const { token, addr } = await settings();
-      if (!token) {
-        setState(false, 'no token set');
-        await sleep(2000);
-        continue;
-      }
+      const { addr } = await settings();
       try {
-        const r = await fetch(`${addr}/v1/poll`, { headers: { 'X-Kai-Token': token } });
+        const r = await fetch(`${addr}/v1/poll`, { headers: HEADERS });
         if (r.status === 200) {
           setState(true);
           handleCommand(await r.json());
         } else if (r.status === 204) {
           setState(true);
         } else {
-          setState(false, r.status === 401 ? 'wrong token' : `Kai answered ${r.status}`);
+          setState(false, `Kai answered HTTP ${r.status}`);
           await sleep(3000);
         }
       } catch (_) {
-        setState(false, 'Kai is not running');
+        setState(false, 'Kai is not running (start it with: kai)');
         await sleep(2000);
       }
     }
@@ -60,16 +150,22 @@ async function pollLoop() {
 }
 
 async function post(ev) {
-  const { token, addr } = await settings();
+  const { addr } = await settings();
   try {
     const r = await fetch(`${addr}/v1/event`, {
       method: 'POST',
-      headers: { 'X-Kai-Token': token, 'Content-Type': 'application/json' },
+      headers: { ...HEADERS, 'Content-Type': 'application/json' },
       body: JSON.stringify(ev),
     });
-    if (!r.ok) lastError = `Kai answered ${r.status}`;
+    if (!r.ok) {
+      lastError = `Kai answered HTTP ${r.status}`;
+      log('warn', `event ${ev.type} was refused: HTTP ${r.status}`);
+    }
+    return r.ok;
   } catch (e) {
-    lastError = String(e);
+    lastError = errText(e);
+    log('warn', `could not send event ${ev.type} to Kai: ${lastError}`);
+    return false;
   }
 }
 
@@ -78,7 +174,7 @@ function enqueue(id, part) {
   if (cancelled.has(id)) return;
   let o = outbox.get(id);
   if (!o) {
-    o = { id, buf: '', final: null, busy: false };
+    o = { id, buf: '', final: null, busy: false, chunks: 0, bytes: 0 };
     outbox.set(id, o);
   }
   if (part.chunk) o.buf += part.chunk;
@@ -95,10 +191,14 @@ async function flush(o) {
       if (o.buf) {
         const data = o.buf;
         o.buf = '';
+        o.chunks++;
+        o.bytes += data.length;
+        if (o.chunks === 1) log('info', `${o.id}: first reply data (${data.length} chars) goes to Kai`);
         await post({ id: o.id, type: 'chunk', data });
       } else {
         const final = o.final;
         o.final = null;
+        log('info', `${o.id}: ${final.type} after ${o.chunks} posts, ${o.bytes} chars${final.message ? ': ' + final.message : ''}`);
         await post(final);
         outbox.delete(o.id);
       }
@@ -108,10 +208,11 @@ async function flush(o) {
   }
 }
 
-// ---- commands from Kai ---------------------------------------------------
+// ---- commands from Kai ---------------------------------------------------------
 
 function handleCommand(cmd) {
   if (cmd.type === 'cancel') {
+    log('info', `${cmd.id}: cancelled by Kai`);
     cancelled.add(cmd.id);
     outbox.delete(cmd.id);
     if (cancelled.size > 50) cancelled.delete(cancelled.values().next().value);
@@ -121,37 +222,81 @@ function handleCommand(cmd) {
 }
 
 async function runSend(cmd) {
+  log('info', `${cmd.id}: send received (session ${cmd.session}, newChat=${cmd.newChat}, ${(cmd.prompt || '').length} chars)`);
+  post({ id: cmd.id, type: 'accepted' });
   try {
-    const tab = await ensureTab(cmd.newChat);
-    const res = await sendToTab(tab.id, { type: 'send', id: cmd.id, prompt: cmd.prompt, newChat: cmd.newChat });
+    const prep = await prepareTab(cmd);
+    if (prep.lost) {
+      log('warn', `${cmd.id}: chat lost: ${prep.lost}`);
+      await post({ id: cmd.id, type: 'chat_lost', message: prep.lost });
+      return;
+    }
+    const res = await sendToTab(prep.tab.id, { type: 'send', id: cmd.id, prompt: cmd.prompt });
     if (!res || !res.ok) {
-      await post({
-        id: cmd.id,
-        type: res && res.code === 'chat_lost' ? 'chat_lost' : 'error',
-        message: (res && res.error) || 'the DeepSeek page did not respond',
-      });
+      const message = (res && res.error) || 'the DeepSeek page did not respond';
+      log('error', `${cmd.id}: could not send: ${message}`);
+      await post({ id: cmd.id, type: 'error', message });
+    } else {
+      log('info', `${cmd.id}: the page sent the message`);
     }
   } catch (e) {
-    await post({ id: cmd.id, type: 'error', message: String((e && e.message) || e) });
+    log('error', `${cmd.id}: ${errText(e)}`);
+    await post({ id: cmd.id, type: 'error', message: errText(e) });
   }
 }
 
-async function ensureTab(newChat) {
-  const tabs = await chrome.tabs.query({ url: 'https://chat.deepseek.com/*' });
-  let tab = tabs.find((t) => t.id === lastTabId) || tabs[0];
+async function findTab() {
+  const tabs = await chrome.tabs.query({ url: DEEPSEEK });
+  return tabs.find((t) => t.id === chat.tabId) || tabs[0] || null;
+}
+
+async function openTab(url) {
+  log('info', `opening ${url} in a new tab`);
+  const tab = await chrome.tabs.create({ url, active: false });
+  await waitLoaded(tab.id);
+  return chrome.tabs.get(tab.id);
+}
+
+async function navigate(tabId, url) {
+  log('info', `tab ${tabId}: going to ${url}`);
+  const loaded = waitLoaded(tabId);
+  await chrome.tabs.update(tabId, { url });
+  await loaded;
+  return chrome.tabs.get(tabId);
+}
+
+// Decide which tab and chat a send goes to.
+async function prepareTab(cmd) {
+  await chatLoaded;
+  let tab = await findTab();
+
+  if (cmd.newChat) {
+    chat = { session: cmd.session, url: null, tabId: null };
+    if (!tab) tab = await openTab(FRESH_CHAT);
+    else if (pathOf(tab.url) !== '/') tab = await navigate(tab.id, FRESH_CHAT);
+    chat.tabId = tab.id;
+    persistChat();
+    return { tab };
+  }
+
+  if (!chat.session || chat.session !== cmd.session) {
+    return { lost: `this extension does not know session ${cmd.session} (it has ${chat.session})` };
+  }
   if (!tab) {
-    tab = await chrome.tabs.create({ url: FRESH_CHAT, active: false });
-    await waitLoaded(tab.id);
-  } else if (newChat && new URL(tab.url).pathname !== '/') {
-    const loaded = waitLoaded(tab.id);
-    await chrome.tabs.update(tab.id, { url: FRESH_CHAT });
-    await loaded;
+    if (!chat.url) return { lost: 'the DeepSeek tab was closed before the chat got an address' };
+    tab = await openTab(chat.url);
+  } else if (chat.url && pathOf(tab.url) !== pathOf(chat.url)) {
+    log('info', `the tab left Kai's chat (${pathOf(tab.url)}): going back`);
+    tab = await navigate(tab.id, chat.url);
+  } else if (!chat.url && isChatPath(pathOf(tab.url))) {
+    chat.url = tab.url;
   }
-  lastTabId = tab.id;
-  return tab;
+  chat.tabId = tab.id;
+  persistChat();
+  return { tab };
 }
 
-function waitLoaded(tabId, timeout = 20000) {
+function waitLoaded(tabId, timeout = 25000) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       chrome.tabs.onUpdated.removeListener(listener);
@@ -168,24 +313,87 @@ function waitLoaded(tabId, timeout = 20000) {
   });
 }
 
-// The content script may not be up yet right after a page load.
+// Tabs that were open before the extension was installed or reloaded have no
+// content script yet: put it there.
+async function injectInto(tabId) {
+  try {
+    await chrome.scripting.executeScript({ target: { tabId }, files: ['inject.js'], world: 'MAIN' });
+    await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
+    log('info', `tab ${tabId}: scripts injected`);
+    return true;
+  } catch (e) {
+    log('error', `tab ${tabId}: could not inject scripts: ${errText(e)}`);
+    return false;
+  }
+}
+
+async function injectAll() {
+  const tabs = await chrome.tabs.query({ url: DEEPSEEK });
+  for (const t of tabs) await injectInto(t.id);
+}
+
 async function sendToTab(tabId, msg) {
-  for (let i = 0; i < 20; i++) {
+  let injected = false;
+  for (let i = 0; i < 24; i++) {
     try {
       return await chrome.tabs.sendMessage(tabId, msg);
-    } catch (_) {
+    } catch (e) {
+      if (i === 2 && !injected) {
+        log('warn', `tab ${tabId} does not answer (${errText(e)}): injecting scripts`);
+        injected = await injectInto(tabId);
+      }
       await sleep(500);
     }
   }
-  throw new Error('could not reach the DeepSeek page: reload the tab and try again');
+  throw new Error('could not reach the DeepSeek page: reload the chat.deepseek.com tab and try again');
 }
 
-// ---- messages from the page and the popup --------------------------------
+// ---- self-test (popup button) --------------------------------------------------
 
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+async function selfTest() {
+  const out = [];
+  const add = (ok, msg) => {
+    out.push((ok ? 'OK    ' : 'FAIL  ') + msg);
+    log(ok ? 'info' : 'warn', `self-test: ${msg}`);
+  };
+  try {
+    const { addr } = await settings();
+    const r = await fetch(`${addr}/v1/status`, { headers: HEADERS });
+    add(r.ok, `Kai answered at ${addr} (HTTP ${r.status})`);
+  } catch (e) {
+    add(false, 'Kai is not reachable: start it with "kai" in a terminal');
+  }
+  const tab = await findTab();
+  if (!tab) {
+    add(false, 'no chat.deepseek.com tab is open: open it and log in');
+    return out;
+  }
+  add(true, `DeepSeek tab found (${pathOf(tab.url) || '/'})`);
+  let probe = null;
+  for (let attempt = 0; attempt < 2 && !probe; attempt++) {
+    try {
+      probe = await chrome.tabs.sendMessage(tab.id, { type: 'probe' });
+    } catch (_) {
+      if (attempt === 0) await injectInto(tab.id);
+      await sleep(400);
+    }
+  }
+  if (!probe) {
+    add(false, 'the page does not answer: reload the DeepSeek tab');
+    return out;
+  }
+  add(probe.hooked, probe.hooked ? `network hook active (v${probe.hook.version})` : 'network hook is NOT active: reload the DeepSeek tab');
+  add(probe.hasInput, probe.hasInput ? 'chat input box found' : 'chat input box NOT found (logged in? page loaded?)');
+  if (probe.loggedOut) add(false, 'the tab shows the login page');
+  return out;
+}
+
+// ---- messages from the page and the popup ----------------------------------------
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   switch (msg.type) {
     case 'status':
-      sendResponse({ connected, lastError });
+      sendResponse({ connected, lastError, version: chrome.runtime.getManifest().version, chatUrl: chat.url });
       return;
     case 'poll_now':
       pollLoop();
@@ -200,16 +408,45 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     case 'sse_error':
       enqueue(msg.id, { error: msg.message });
       return;
+    case 'sent':
+      log('info', `${msg.id}: the page started the completion request`);
+      post({ id: msg.id, type: 'sent' });
+      return;
+    case 'page_url':
+      if (sender.tab) noteUrl(sender.tab.id, msg.url);
+      return;
+    case 'log':
+      log(msg.level || 'info', msg.msg, msg.src || 'page');
+      return;
+    case 'get_logs':
+      logsReady.then(() => sendResponse({ text: logBuf.map(fmt).join('\n') + '\n' }));
+      return true;
+    case 'clear_logs':
+      logBuf = [];
+      pending = [];
+      chrome.storage.local.remove('logs');
+      sendResponse({});
+      return;
+    case 'self_test':
+      selfTest().then((lines) => sendResponse({ lines }));
+      return true;
   }
 });
 
-// ---- keep the worker alive -----------------------------------------------
+// ---- keep the worker alive -----------------------------------------------------
 
 chrome.alarms.create('kai-wake', { periodInMinutes: 0.5 });
 chrome.alarms.onAlarm.addListener(() => pollLoop());
 setInterval(() => chrome.runtime.getPlatformInfo(() => {}), 20000);
 chrome.runtime.onStartup.addListener(() => pollLoop());
-chrome.runtime.onInstalled.addListener(() => pollLoop());
-chrome.storage.onChanged.addListener(() => pollLoop());
+chrome.runtime.onInstalled.addListener((d) => {
+  log('info', `extension ${d.reason} (v${chrome.runtime.getManifest().version})`);
+  injectAll();
+  pollLoop();
+});
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && changes.addr) pollLoop();
+});
 
+log('info', `worker started (v${chrome.runtime.getManifest().version})`);
 pollLoop();
