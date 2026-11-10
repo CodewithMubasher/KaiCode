@@ -32,10 +32,12 @@ Set the page's DeepThink / Search toggles the way you want; Kai does not change 
 ## How it works
 
 - `inject.js` (page context) wraps `fetch` (and XHR as a fallback); after Kai sends a message it copies the `/api/v0/chat/completion` stream and passes the raw SSE text on.
-- `content.js` types the prompt into the chat box and presses Enter (falls back to the send button).
+- `content.js` types the prompt into the chat box and presses Enter (falls back to the send button). Typing, Enter and the send-button click go through Chrome's debugger protocol, so the page sees **trusted** input; if the debugger cannot attach (for example while DevTools is open) `content.js` falls back to DOM events.
 - `background.js` long-polls `http://127.0.0.1:8765/v1/poll` for commands and POSTs the SSE chunks and log lines back. The bridge only listens on localhost and rejects web pages.
+- The extension never reads, stores or replays your DeepSeek token or cookies: the page makes its own requests with its own session. The `debugger` permission is used only for input into the DeepSeek tab.
 
 ## Known limits
 
 - Selectors are heuristic (the chat is a `<textarea>`, Enter sends). If DeepSeek changes its page, `content.js` is the only file to touch.
+- Trusted input needs the `debugger` permission and cannot attach while DevTools is open on the tab; the DOM fallback still works, but its events are synthetic and a page can tell them apart.
 - Stopping a reply in Kai stops relaying it; the page may keep generating until it finishes.

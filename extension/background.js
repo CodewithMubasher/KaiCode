@@ -231,7 +231,12 @@ async function runSend(cmd) {
       await post({ id: cmd.id, type: 'chat_lost', message: prep.lost });
       return;
     }
-    const res = await sendToTab(prep.tab.id, { type: 'send', id: cmd.id, prompt: cmd.prompt });
+    let res;
+    try {
+      res = await sendToTab(prep.tab.id, { type: 'send', id: cmd.id, prompt: cmd.prompt });
+    } finally {
+      await detachDebugger(prep.tab.id);
+    }
     if (!res || !res.ok) {
       const message = (res && res.error) || 'the DeepSeek page did not respond';
       log('error', `${cmd.id}: could not send: ${message}`);
@@ -348,6 +353,123 @@ async function sendToTab(tabId, msg) {
   throw new Error('could not reach the DeepSeek page: reload the chat.deepseek.com tab and try again');
 }
 
+// ---- trusted input ------------------------------------------------------------
+// content.js uses dispatchEvent()/el.click(), which produce isTrusted === false.
+// The debugger protocol drives Chrome's own input pipeline instead, so the page
+// receives the same kind of events a real user produces. It needs the
+// "debugger" permission and cannot attach while DevTools is open on that tab;
+// content.js then falls back to the DOM path.
+
+const TRUSTED_IDLE = 5000;
+const debugging = new Map(); // tabId -> { timer }
+
+async function debugSend(tabId, method, params) {
+  if (!chrome.debugger) throw new Error('the debugger permission is not active: reload the extension');
+  let d = debugging.get(tabId);
+  if (!d) {
+    await chrome.debugger.attach({ tabId }, '1.3');
+    d = { timer: null };
+    debugging.set(tabId, d);
+    log('info', `tab ${tabId}: trusted input attached`);
+  }
+  if (d.timer) {
+    clearTimeout(d.timer);
+    d.timer = null;
+  }
+  try {
+    return await chrome.debugger.sendCommand({ tabId }, method, params);
+  } finally {
+    d.timer = setTimeout(() => detachDebugger(tabId), TRUSTED_IDLE);
+  }
+}
+
+async function detachDebugger(tabId) {
+  const d = debugging.get(tabId);
+  if (!d) return;
+  if (d.timer) clearTimeout(d.timer);
+  debugging.delete(tabId);
+  try {
+    await chrome.debugger.detach({ tabId });
+  } catch (_) {
+    /* already gone (tab closed, worker suspended) */
+  }
+}
+
+async function trustedInput(msg, sender) {
+  const tabId = sender.tab && sender.tab.id;
+  if (tabId == null) return { ok: false, error: 'no tab' };
+  try {
+    switch (msg.op) {
+      case 'insertText':
+        if (typeof msg.text !== 'string') return { ok: false, error: 'no text' };
+        await debugSend(tabId, 'Input.insertText', { text: msg.text });
+        return { ok: true };
+      case 'key':
+        if (msg.key !== 'Enter') return { ok: false, error: `unsupported key ${msg.key}` };
+        await debugSend(tabId, 'Input.dispatchKeyEvent', {
+          type: 'keyDown',
+          key: 'Enter',
+          code: 'Enter',
+          windowsVirtualKeyCode: 13,
+          nativeVirtualKeyCode: 13,
+          text: '\r',
+          unmodifiedText: '\r',
+        });
+        await debugSend(tabId, 'Input.dispatchKeyEvent', {
+          type: 'keyUp',
+          key: 'Enter',
+          code: 'Enter',
+          windowsVirtualKeyCode: 13,
+          nativeVirtualKeyCode: 13,
+        });
+        return { ok: true };
+      case 'click': {
+        const x = Number(msg.x);
+        const y = Number(msg.y);
+        if (!Number.isFinite(x) || !Number.isFinite(y)) return { ok: false, error: 'bad click coordinates' };
+        await debugSend(tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
+        await debugSend(tabId, 'Input.dispatchMouseEvent', {
+          type: 'mousePressed',
+          x,
+          y,
+          button: 'left',
+          buttons: 1,
+          clickCount: 1,
+        });
+        await debugSend(tabId, 'Input.dispatchMouseEvent', {
+          type: 'mouseReleased',
+          x,
+          y,
+          button: 'left',
+          buttons: 0,
+          clickCount: 1,
+        });
+        return { ok: true };
+      }
+      default:
+        return { ok: false, error: `unknown operation ${msg.op}` };
+    }
+  } catch (e) {
+    return { ok: false, error: errText(e) };
+  }
+}
+
+if (chrome.debugger) {
+  chrome.debugger.onDetach.addListener((source, reason) => {
+    if (source.tabId == null) return;
+    const d = debugging.get(source.tabId);
+    if (d && d.timer) clearTimeout(d.timer);
+    debugging.delete(source.tabId);
+    log('info', `tab ${source.tabId}: trusted input detached (${reason})`);
+  });
+}
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  const d = debugging.get(tabId);
+  if (d && d.timer) clearTimeout(d.timer);
+  debugging.delete(tabId);
+});
+
 // ---- self-test (popup button) --------------------------------------------------
 
 async function selfTest() {
@@ -369,6 +491,17 @@ async function selfTest() {
     return out;
   }
   add(true, `DeepSeek tab found (${pathOf(tab.url) || '/'})`);
+  if (chrome.debugger) {
+    try {
+      await chrome.debugger.attach({ tabId: tab.id }, '1.3');
+      await chrome.debugger.detach({ tabId: tab.id });
+      add(true, 'trusted input is available (debugger protocol)');
+    } catch (e) {
+      add(false, `trusted input unavailable (${errText(e)}): Kai will use DOM events`);
+    }
+  } else {
+    add(false, 'trusted input unavailable: the debugger permission is missing');
+  }
   let probe = null;
   for (let attempt = 0; attempt < 2 && !probe; attempt++) {
     try {
@@ -408,6 +541,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     case 'sse_error':
       enqueue(msg.id, { error: msg.message });
       return;
+    case 'trusted':
+      trustedInput(msg, sender).then(sendResponse);
+      return true;
     case 'sent':
       log('info', `${msg.id}: the page started the completion request`);
       post({ id: msg.id, type: 'sent' });

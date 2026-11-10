@@ -39,4 +39,9 @@ readable by you only), sessions, every message, and settings such as the active
 provider. **Switch session** (`/continue`), **Rename session** (`/rename`) and
 **Delete session** are in the `ctrl+p` menu.
 
+Kai never asks for, stores or replays your DeepSeek token or cookies. The web
+path keeps the browser in charge of the session: the extension types with
+Chrome's input pipeline and copies the page's own reply stream. It does not call
+DeepSeek's internal endpoints from Go.
+
 Build: run `go get modernc.org/sqlite && go mod tidy` once (pure Go, no C compiler).

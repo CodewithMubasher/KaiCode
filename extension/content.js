@@ -18,6 +18,54 @@
   }
   const log = (level, msg) => relay({ type: 'log', src: 'page', level, msg });
 
+  // ---- trusted input --------------------------------------------------------
+  // dispatchEvent() and el.click() produce events with isTrusted === false,
+  // which a page can tell apart from a real user. background.js can drive
+  // Chrome's own input pipeline through the debugger protocol; those events are
+  // trusted. If that is unavailable (DevTools is open, the permission was not
+  // granted, the tab is not inspectable), every helper falls back to the DOM
+  // path so Kai keeps working.
+  function trusted(op, data) {
+    return new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage({ type: 'trusted', op, ...data }, (res) => {
+          if (chrome.runtime.lastError) {
+            resolve({ ok: false, error: chrome.runtime.lastError.message });
+          } else {
+            resolve(res || { ok: false, error: 'no answer from the extension' });
+          }
+        });
+      } catch (e) {
+        resolve({ ok: false, error: String((e && e.message) || e) });
+      }
+    });
+  }
+
+  async function typePrompt(input, text) {
+    input.focus();
+    try {
+      input.setSelectionRange(0, (input.value || '').length);
+    } catch (_) {}
+    const t = await trusted('insertText', { text });
+    if (t.ok) {
+      await sleep(150);
+      if ((input.value || '').length === text.length) {
+        log('info', `typed ${text.length} chars with trusted input`);
+        return;
+      }
+      log('warn', `trusted input left ${(input.value || '').length} chars, expected ${text.length}: using the DOM fallback`);
+    } else {
+      log('warn', `trusted input unavailable (${t.error}): using the DOM fallback`);
+    }
+    setText(input, text);
+    await sleep(250);
+    if ((input.value || '').length !== text.length) {
+      log('warn', `textarea holds ${(input.value || '').length} chars, expected ${text.length}: typing again`);
+      setText(input, text);
+      await sleep(250);
+    }
+  }
+
   // ---- what the page-world hook tells us ------------------------------------
   window.addEventListener('message', (e) => {
     if (e.source !== window || !e.data || e.data.kai !== true || e.data.from !== 'inject') return;
@@ -107,15 +155,9 @@
     }
 
     window.postMessage({ kai: true, from: 'content', type: 'arm', id }, '*');
+    await typePrompt(input, prompt);
     const started = waitForStart(id, 12000);
-    setText(input, prompt);
-    await sleep(250);
-    if ((input.value || '').length !== prompt.length) {
-      log('warn', `textarea holds ${(input.value || '').length} chars, expected ${prompt.length}: typing again`);
-      setText(input, prompt);
-      await sleep(250);
-    }
-    pressEnter(input);
+    await pressEnter(input);
 
     if (await started) return { ok: true };
 
@@ -124,7 +166,7 @@
     log('warn', `Enter did not send within 12s (textarea still has ${left} chars)`);
     if (left > 0) {
       const retry = waitForStart(id, 15000);
-      const clicked = clickSend(input);
+      const clicked = await clickSend(input);
       log('info', clicked ? 'clicked the send button' : 'no usable send button found');
       if (await retry) return { ok: true };
     } else {
@@ -178,7 +220,14 @@
     el.dispatchEvent(new Event('change', { bubbles: true }));
   }
 
-  function pressEnter(el) {
+  async function pressEnter(input) {
+    const t = await trusted('key', { key: 'Enter' });
+    if (t.ok) return;
+    log('warn', `trusted Enter unavailable (${t.error}): using DOM events`);
+    syntheticEnter(input);
+  }
+
+  function syntheticEnter(el) {
     const init = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true };
     el.dispatchEvent(new KeyboardEvent('keydown', init));
     el.dispatchEvent(new KeyboardEvent('keypress', init));
@@ -186,7 +235,7 @@
   }
 
   // The send button is an icon-only button near the input.
-  function clickSend(input) {
+  function findSendButton(input) {
     let box = input;
     for (let i = 0; i < 5 && box.parentElement; i++) box = box.parentElement;
     const buttons = [...box.querySelectorAll('[role="button"], button')].filter(
@@ -196,8 +245,21 @@
         b.querySelector('svg') &&
         !(b.textContent || '').trim()
     );
-    const send = buttons[buttons.length - 1];
+    return buttons[buttons.length - 1] || null;
+  }
+
+  async function clickSend(input) {
+    const send = findSendButton(input);
     if (!send) return false;
+    send.scrollIntoView({ block: 'center', inline: 'center' });
+    await sleep(100);
+    const r = send.getBoundingClientRect();
+    const t = await trusted('click', { x: r.left + r.width / 2, y: r.top + r.height / 2 });
+    if (t.ok) {
+      log('info', 'clicked the send button with trusted input');
+      return true;
+    }
+    log('warn', `trusted click unavailable (${t.error}): using the DOM fallback`);
     send.click();
     return true;
   }

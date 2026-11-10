@@ -1,5 +1,5 @@
 // Package deepseek decodes the server-sent-event stream of DeepSeek's web
-// chat into harness events, and describes the request the bridge sends.
+// chat into harness events.
 package deepseek
 
 import (

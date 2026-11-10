@@ -232,6 +232,17 @@ func TestGuard(t *testing.T) {
 	}
 }
 
+func TestCredentialSyncIsGone(t *testing.T) {
+	_, ts := newTestServer(t)
+	// The bridge no longer accepts browser credentials; nothing may be written
+	// to disk or replayed outside the browser.
+	resp := do(t, "POST", ts.URL+"/_sync", `{"token":"secret","cookie":"c"}`, nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("/_sync status = %d, want 404", resp.StatusCode)
+	}
+}
+
 func TestSentIsReportedBeforeAnyReply(t *testing.T) {
 	s, ts := newTestServer(t)
 	cmdCh := make(chan Command, 1)

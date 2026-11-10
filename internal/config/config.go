@@ -75,8 +75,11 @@ func Load(path string) (*Config, error) {
 		cfg.Storage.Path = Default().Storage.Path
 	}
 	// Older configs point at logs/kai.log with level "info". Move them to the
-	// single logs.txt with full detail so problems can be analysed.
-	if cfg.Log.File == filepath.Join(KaiDir(), "logs", "kai.log") {
+	// single logs.txt with full detail so problems can be analysed. Compare
+	// with FromSlash so a config written with forward slashes is migrated on
+	// Windows too.
+	legacyLog := filepath.Join(KaiDir(), "logs", "kai.log")
+	if filepath.Clean(filepath.FromSlash(cfg.Log.File)) == filepath.Clean(filepath.FromSlash(legacyLog)) {
 		def := Default()
 		cfg.Log.File = def.Log.File
 		if cfg.Log.Level == "info" {
