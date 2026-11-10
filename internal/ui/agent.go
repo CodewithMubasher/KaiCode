@@ -22,8 +22,19 @@ import (
 	"kai/internal/ui/components"
 )
 
+// kaiSystem is Kai's instructions for DeepSeek Web. The web chat has no system
+// role, so the harness puts it in the first message, next to the DSML block
+// that teaches the model the tool-call format.
 func kaiSystem() string {
 	return "You are Kai, a coding agent working in the user's project directory.\n\n" + tools.SystemGuide()
+}
+
+// kaiSystemNative is Kai's instructions for OpenAI-compatible providers. It is
+// the API's system message. The tools are passed as API tool definitions, so
+// it says nothing about a call format, and it tells the model not to invent one.
+func kaiSystemNative() string {
+	return "You are Kai, a coding agent working in the user's project directory.\n\n" + tools.SystemGuide() +
+		"\n- Call tools only through the API's tool-calling interface. Never write tool-call markup or tool results as text in your reply."
 }
 
 const toolTimeout = 11 * time.Minute
@@ -64,11 +75,11 @@ func newRunState(cfg *config.Config, ps *persister, hub *providerHub) runState {
 			active = parseActive(v)
 		}
 	}
-	prov, label, err := hub.build(active)
+	backend, label, err := hub.build(active)
 	if err != nil {
 		slog.Warn("the saved provider is unavailable, using DeepSeek Web", "provider", active.String(), "err", err)
 		active = activeProvider{Kind: "web"}
-		prov, label, _ = hub.build(active)
+		backend, label, _ = hub.build(active)
 	}
 	hub.active, hub.label = active, label
 	ps.setProvider(label)
@@ -79,11 +90,13 @@ func newRunState(cfg *config.Config, ps *persister, hub *providerHub) runState {
 	}
 
 	return runState{agent: harness.New(harness.Config{
-		Provider:    prov,
-		Tools:       reg,
-		System:      kaiSystem(),
-		ToolTimeout: toolTimeout,
-		Record:      record,
+		Provider:     backend.Web,    // DeepSeek Web: DSML
+		Native:       backend.Native, // custom OpenAI-compatible: API tool calling
+		Tools:        reg,
+		System:       kaiSystem(),
+		NativeSystem: kaiSystemNative(),
+		ToolTimeout:  toolTimeout,
+		Record:       record,
 	})}
 }
 

@@ -77,28 +77,31 @@ type providerHub struct {
 	label  string
 }
 
-func (h *providerHub) build(a activeProvider) (harness.Provider, string, error) {
+// build returns the backend for a choice. DeepSeek Web (and the scripted demo)
+// is the DSML path; a custom provider is the native tool-calling path. A
+// Backend holds one or the other, never both.
+func (h *providerHub) build(a activeProvider) (harness.Backend, string, error) {
 	switch a.Kind {
 	case "mock":
-		return &harness.MockProvider{Script: harness.DemoScript, ChunkRunes: 4, Delay: 15 * time.Millisecond}, "Demo (scripted)", nil
+		return harness.Backend{Web: &harness.MockProvider{Script: harness.DemoScript, ChunkRunes: 4, Delay: 15 * time.Millisecond}}, "Demo (scripted)", nil
 	case "custom":
 		if h.st == nil {
-			return nil, "", errors.New("storage is unavailable")
+			return harness.Backend{}, "", errors.New("storage is unavailable")
 		}
 		p, err := h.st.ProviderByID(a.ID)
 		if err != nil {
-			return nil, "", fmt.Errorf("that provider no longer exists")
+			return harness.Backend{}, "", fmt.Errorf("that provider no longer exists")
 		}
 		if strings.TrimSpace(p.Model) == "" {
-			return nil, "", errNoModel
+			return harness.Backend{}, "", errNoModel
 		}
 		prov := openai.New(openai.Config{Name: p.Name, BaseURL: p.BaseURL, APIKey: p.APIKey, Model: p.Model})
-		return prov, p.Name + " · " + p.Model, nil
+		return harness.Backend{Native: prov}, p.Name + " · " + p.Model, nil
 	default:
 		if h.web == nil {
 			h.web = startBridge(h.cfg)
 		}
-		return h.web, "DeepSeek Web", nil
+		return harness.Backend{Web: h.web}, "DeepSeek Web", nil
 	}
 }
 
@@ -228,7 +231,7 @@ func (m Model) submitAddProvider() (Model, tea.Cmd) {
 // activate makes a provider the one that answers. The conversation continues:
 // the next message opens a fresh chat on the new provider with a recap.
 func (m Model) activate(a activeProvider) (Model, tea.Cmd) {
-	prov, label, err := m.hub.build(a)
+	backend, label, err := m.hub.build(a)
 	if errors.Is(err, errNoModel) {
 		return m.chooseModel(a.ID)
 	}
@@ -241,7 +244,7 @@ func (m Model) activate(a activeProvider) (Model, tea.Cmd) {
 		m.chat = m.chat.Stop()
 		m.state, m.fake = StateIdle, nil
 	}
-	m.run.agent.SetProvider(prov)
+	m.run.agent.SetBackend(backend)
 	m.run.tokens = 0
 	m.hub.active, m.hub.label = a, label
 	m.ps.setProvider(label)

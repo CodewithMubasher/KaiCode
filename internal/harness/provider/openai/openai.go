@@ -1,10 +1,13 @@
 // Package openai talks to any OpenAI-compatible chat completions endpoint
 // (OpenAI, DeepSeek's official API, OpenRouter, Together, Groq, Ollama,
-// LM Studio, vLLM, ...). Unlike a web chat, these APIs are stateless, so the
-// provider keeps the conversation itself and sends it with every request.
+// LM Studio, vLLM, ...).
 //
-// Tool calls still use Kai's DSML text format, which works with any model that
-// follows instructions; native tool_calls can come later.
+// It is the native tool-calling path and has nothing in common with the
+// DeepSeek web chat: no DSML, no tool block inside a prompt. The tools go in
+// the request's "tools" field, the instructions in a real system message, the
+// model's calls come back as structured tool_calls and the results go back as
+// "tool" messages. The provider is stateless: the agent owns the conversation
+// and sends all of it with every request.
 package openai
 
 import (
@@ -23,45 +26,37 @@ import (
 	"time"
 
 	"kai/internal/harness"
+	"kai/internal/tools"
 )
 
 const (
-	idleTimeout     = 2 * time.Minute  // no data from the stream
-	headerTimeout   = 2 * time.Minute  // no response headers
-	defaultMaxBytes = 600 << 10        // history kept per chat (about 150k tokens)
+	idleTimeout   = 2 * time.Minute // no data from the stream
+	headerTimeout = 2 * time.Minute // no response headers
 )
 
 // Config describes one endpoint.
 type Config struct {
-	Name            string       // shown in messages
-	BaseURL         string       // e.g. https://api.openai.com/v1
-	APIKey          string       // may be empty for local servers
-	Model           string       // required
-	Client          *http.Client // optional, for tests
-	MaxHistoryBytes int          // 0 = default
+	Name    string       // shown in messages
+	BaseURL string       // e.g. https://api.openai.com/v1
+	APIKey  string       // may be empty for local servers
+	Model   string       // required
+	Client  *http.Client // optional, for tests
 }
 
-type message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
-// Provider implements harness.Provider.
+// Provider implements harness.NativeProvider.
 type Provider struct {
 	cfg    Config
 	client *http.Client
 
-	mu      sync.Mutex
-	session string
-	history []message
-	nextID  int
+	mu       sync.Mutex
+	echoReas bool // the endpoint streams "reasoning_content", so it expects it back in tool loops
+	nextCall int  // numbers calls the endpoint gave no id
 }
+
+var _ harness.NativeProvider = (*Provider)(nil)
 
 // New builds a provider.
 func New(cfg Config) *Provider {
-	if cfg.MaxHistoryBytes <= 0 {
-		cfg.MaxHistoryBytes = defaultMaxBytes
-	}
 	c := cfg.Client
 	if c == nil {
 		c = newClient()
@@ -103,9 +98,72 @@ func hostOf(base string) string {
 	return "the provider"
 }
 
-// Send implements harness.Provider. The agent sends only new content after
-// the first message of a chat, so the full conversation is rebuilt here.
-func (p *Provider) Send(ctx context.Context, t harness.Turn) (<-chan harness.StreamEvent, error) {
+// ---- request ---------------------------------------------------------------
+
+type wireCall struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
+type wireMessage struct {
+	Role             string     `json:"role"`
+	Content          any        `json:"content"` // a string, or null for an assistant message that only calls tools
+	ReasoningContent string     `json:"reasoning_content,omitempty"`
+	ToolCalls        []wireCall `json:"tool_calls,omitempty"`
+	ToolCallID       string     `json:"tool_call_id,omitempty"`
+}
+
+type wireTool struct {
+	Type     string          `json:"type"`
+	Function json.RawMessage `json:"function"` // name, description, parameters
+}
+
+func (p *Provider) wireMessages(in []harness.ChatMessage) []wireMessage {
+	p.mu.Lock()
+	echo := p.echoReas
+	p.mu.Unlock()
+
+	out := make([]wireMessage, 0, len(in))
+	for _, m := range in {
+		w := wireMessage{Role: m.Role, ToolCallID: m.ToolCallID}
+		if m.Role == "assistant" && m.Content == "" && len(m.ToolCalls) > 0 {
+			w.Content = nil
+		} else {
+			w.Content = m.Content
+		}
+		if echo && m.Role == "assistant" {
+			w.ReasoningContent = m.Reasoning
+		}
+		for _, c := range m.ToolCalls {
+			wc := wireCall{ID: c.ID, Type: "function"}
+			wc.Function.Name = c.Name
+			// Strict endpoints refuse arguments that are not valid JSON, and a
+			// model's broken call is exactly that; the error result tells it so.
+			wc.Function.Arguments = c.Arguments
+			if !json.Valid([]byte(c.Arguments)) {
+				wc.Function.Arguments = "{}"
+			}
+			w.ToolCalls = append(w.ToolCalls, wc)
+		}
+		out = append(out, w)
+	}
+	return out
+}
+
+func wireTools(specs []tools.Spec) []wireTool {
+	out := make([]wireTool, 0, len(specs))
+	for _, s := range specs {
+		out = append(out, wireTool{Type: "function", Function: json.RawMessage(s.JSON())})
+	}
+	return out
+}
+
+// Chat implements harness.NativeProvider.
+func (p *Provider) Chat(ctx context.Context, req harness.ChatRequest) (<-chan harness.StreamEvent, error) {
 	if strings.TrimSpace(p.cfg.Model) == "" {
 		return nil, fmt.Errorf("no model is set for %s: choose one with Switch model", p.cfg.Name)
 	}
@@ -114,29 +172,30 @@ func (p *Provider) Send(ctx context.Context, t harness.Turn) (<-chan harness.Str
 		return nil, err
 	}
 
-	p.mu.Lock()
-	if t.NewChat || t.Session != p.session {
-		p.history, p.session = nil, t.Session
+	payload := map[string]any{
+		"model":    p.cfg.Model,
+		"messages": p.wireMessages(req.Messages),
+		"stream":   true,
 	}
-	msgs := append(append([]message(nil), p.history...), message{Role: "user", Content: t.Prompt})
-	msgs = trim(msgs, p.cfg.MaxHistoryBytes)
-	p.mu.Unlock()
-
-	body, err := json.Marshal(map[string]any{"model": p.cfg.Model, "messages": msgs, "stream": true})
+	if len(req.Tools) > 0 {
+		payload["tools"] = wireTools(req.Tools)
+	}
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
 	}
+
 	reqCtx, cancel := context.WithCancel(ctx)
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, endpointURL, bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, endpointURL, bytes.NewReader(body))
 	if err != nil {
 		cancel()
 		return nil, err
 	}
-	setHeaders(req, p.cfg.APIKey)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "text/event-stream")
+	setHeaders(httpReq, p.cfg.APIKey)
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "text/event-stream")
 
-	resp, err := p.client.Do(req)
+	resp, err := p.client.Do(httpReq)
 	if err != nil {
 		cancel()
 		return nil, networkError(err, p.cfg.BaseURL)
@@ -147,17 +206,33 @@ func (p *Provider) Send(ctx context.Context, t harness.Turn) (<-chan harness.Str
 		return nil, apiError(resp, p.cfg.BaseURL)
 	}
 
-	// The provider accepted the request: from now on the chat holds this
-	// prompt, whatever happens to the reply.
-	p.mu.Lock()
-	p.history = msgs
-	p.nextID += 2
-	id := p.nextID
-	p.mu.Unlock()
-
 	ch := make(chan harness.StreamEvent, 32)
-	go p.stream(ctx, reqCtx, cancel, resp, id, ch)
+	go p.stream(ctx, reqCtx, cancel, resp, ch)
 	return ch, nil
+}
+
+// ---- reply -----------------------------------------------------------------
+
+// argText reads a tool call's arguments. They are a JSON string holding JSON,
+// but some servers send the object itself; both end up as JSON text.
+type argText string
+
+func (a *argText) UnmarshalJSON(b []byte) error {
+	b = bytes.TrimSpace(b)
+	if len(b) > 0 && b[0] == '"' {
+		var s string
+		if err := json.Unmarshal(b, &s); err != nil {
+			return err
+		}
+		*a = argText(s)
+		return nil
+	}
+	if string(b) == "null" {
+		*a = ""
+		return nil
+	}
+	*a = argText(b)
+	return nil
 }
 
 type chunk struct {
@@ -166,6 +241,14 @@ type chunk struct {
 			Content          string `json:"content"`
 			ReasoningContent string `json:"reasoning_content"`
 			Reasoning        string `json:"reasoning"`
+			ToolCalls        []struct {
+				Index    *int   `json:"index"`
+				ID       string `json:"id"`
+				Function struct {
+					Name      string  `json:"name"`
+					Arguments argText `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls"`
 		} `json:"delta"`
 		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
@@ -174,7 +257,50 @@ type chunk struct {
 	} `json:"error"`
 }
 
-func (p *Provider) stream(ctx, reqCtx context.Context, cancel context.CancelFunc, resp *http.Response, id int, ch chan<- harness.StreamEvent) {
+// callAcc collects one tool call from its streamed fragments.
+type callAcc struct {
+	id, name string
+	args     strings.Builder
+	scan     argScanner
+	last     harness.ToolProgress // last progress sent for this call
+	sentProg bool
+}
+
+// callSet collects the calls of one reply. Fragments belong to a call by
+// "index"; a server that leaves the index out is followed by id instead.
+type callSet struct {
+	list    []*callAcc
+	byIndex map[int]*callAcc
+}
+
+func (s *callSet) pick(index *int, id string) *callAcc {
+	add := func() *callAcc {
+		a := &callAcc{}
+		s.list = append(s.list, a)
+		return a
+	}
+	if index != nil {
+		if s.byIndex == nil {
+			s.byIndex = map[int]*callAcc{}
+		}
+		a := s.byIndex[*index]
+		// A server that reuses one index for several calls still sends a new id.
+		if a != nil && id != "" && a.id != "" && a.id != id {
+			a = nil
+		}
+		if a == nil {
+			a = add()
+			s.byIndex[*index] = a
+		}
+		return a
+	}
+	if n := len(s.list); n > 0 && (id == "" || s.list[n-1].id == id) {
+		return s.list[n-1]
+	}
+	return add()
+}
+
+func (p *Provider) stream(ctx, reqCtx context.Context, cancel context.CancelFunc, resp *http.Response, ch chan<- harness.StreamEvent) {
 	defer close(ch) // runs last: the agent may send again as soon as it closes
 	defer cancel()
 	defer resp.Body.Close()
@@ -188,25 +314,10 @@ func (p *Provider) stream(ctx, reqCtx context.Context, cancel context.CancelFunc
 		}
 	}
 
-	var reply strings.Builder
-	// Keep the provider's record equal to what the user saw, including a
-	// reply that was stopped half way.
-	defer func() {
-		if s := reply.String(); s != "" {
-			p.mu.Lock()
-			p.history = append(p.history, message{Role: "assistant", Content: s})
-			p.mu.Unlock()
-		}
-	}()
-
-	if !send(harness.StreamEvent{Kind: harness.StreamSent}) ||
-		!send(harness.StreamEvent{Kind: harness.StreamReady, MessageID: id}) {
-		return
-	}
-
 	idle := time.AfterFunc(idleTimeout, cancel)
 	defer idle.Stop()
 
+	var calls callSet
 	r := bufio.NewReaderSize(resp.Body, 64<<10)
 	finish, done := "", false
 	var rerr error
@@ -228,16 +339,37 @@ func (p *Provider) stream(ctx, reqCtx context.Context, cancel context.CancelFunc
 				}
 				for _, choice := range c.Choices {
 					reason := choice.Delta.ReasoningContent
-					if reason == "" {
+					if reason != "" {
+						p.mu.Lock()
+						p.echoReas = true
+						p.mu.Unlock()
+					} else {
 						reason = choice.Delta.Reasoning
 					}
 					if reason != "" && !send(harness.StreamEvent{Kind: harness.StreamThinking, Text: reason}) {
 						return
 					}
-					if choice.Delta.Content != "" {
-						reply.WriteString(choice.Delta.Content)
-						if !send(harness.StreamEvent{Kind: harness.StreamText, Text: choice.Delta.Content}) {
-							return
+					if choice.Delta.Content != "" && !send(harness.StreamEvent{Kind: harness.StreamText, Text: choice.Delta.Content}) {
+						return
+					}
+					for _, tc := range choice.Delta.ToolCalls {
+						a := calls.pick(tc.Index, tc.ID)
+						if a.id == "" {
+							a.id = tc.ID
+						}
+						if a.name == "" {
+							a.name = tc.Function.Name
+						}
+						frag := string(tc.Function.Arguments)
+						a.args.WriteString(frag)
+						if a.name == "edit_file" && frag != "" {
+							if pr, ok := a.scan.Feed(frag); ok && (!a.sentProg || pr != a.last) {
+								a.last, a.sentProg = pr, true
+								hp := pr
+								if !send(harness.StreamEvent{Kind: harness.StreamToolProgress, Tool: &hp}) {
+									return
+								}
+							}
 						}
 					}
 					if choice.FinishReason != nil && *choice.FinishReason != "" {
@@ -262,13 +394,39 @@ func (p *Provider) stream(ctx, reqCtx context.Context, cancel context.CancelFunc
 			err = fmt.Errorf("the connection to %s broke: %v", hostOf(p.cfg.BaseURL), rerr)
 		}
 		send(harness.StreamEvent{Kind: harness.StreamError, Err: err})
+	case finish == "length" || finish == "content_filter":
+		// The calls, if any, may be cut off: do not run them. The agent
+		// reports "the reply ended early (status length)".
+		send(harness.StreamEvent{Kind: harness.StreamEnd, Text: finish})
 	default:
-		status := "FINISHED"
-		if finish == "length" || finish == "content_filter" {
-			status = finish // the agent reports "the reply ended early (status length)"
+		for _, tc := range p.finishCalls(&calls) {
+			tc := tc
+			if !send(harness.StreamEvent{Kind: harness.StreamToolCall, ToolCall: &tc}) {
+				return
+			}
 		}
-		send(harness.StreamEvent{Kind: harness.StreamEnd, Text: status})
+		send(harness.StreamEvent{Kind: harness.StreamEnd, Text: "FINISHED"})
 	}
+}
+
+// finishCalls turns the collected fragments into complete calls. A call the
+// server gave no id gets one, since every result must name its call.
+func (p *Provider) finishCalls(s *callSet) []harness.ToolCall {
+	var out []harness.ToolCall
+	for _, a := range s.list {
+		if strings.TrimSpace(a.name) == "" {
+			continue
+		}
+		id := a.id
+		if id == "" {
+			p.mu.Lock()
+			p.nextCall++
+			id = fmt.Sprintf("call_%d", p.nextCall)
+			p.mu.Unlock()
+		}
+		out = append(out, harness.ToolCall{ID: id, Name: a.name, Arguments: a.args.String()})
+	}
+	return out
 }
 
 // sseData returns the payload of a "data:" line.
@@ -279,24 +437,6 @@ func sseData(line string) (string, bool) {
 		return "", false
 	}
 	return strings.TrimSpace(rest), true
-}
-
-// trim drops the oldest messages after the first one until the history fits
-// the budget. The newest message is always kept.
-func trim(msgs []message, budget int) []message {
-	size := 0
-	for _, m := range msgs {
-		size += len(m.Content)
-	}
-	if size <= budget || len(msgs) <= 2 {
-		return msgs
-	}
-	out := append([]message(nil), msgs...)
-	for size > budget && len(out) > 2 {
-		size -= len(out[1].Content)
-		out = append(out[:1], out[2:]...)
-	}
-	return out
 }
 
 func setHeaders(req *http.Request, key string) {
@@ -347,6 +487,10 @@ func apiError(resp *http.Response, base string) error {
 		hint = " (check the Base URL and model name; most providers need a /v1 suffix)"
 	case http.StatusTooManyRequests:
 		hint = " (rate limited or out of quota)"
+	case http.StatusBadRequest, http.StatusUnprocessableEntity:
+		if l := strings.ToLower(msg); strings.Contains(l, "tool") || strings.Contains(l, "function") {
+			hint = " (this model may not support tool calling: choose one that does)"
+		}
 	}
 	if msg == "" {
 		msg = http.StatusText(resp.StatusCode)

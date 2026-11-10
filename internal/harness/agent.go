@@ -4,30 +4,38 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 	"sync"
 	"time"
 
-	"kai/internal/harness/dsml"
 	"kai/internal/tools"
 )
 
 // progressEvery is the longest a growing line count waits before it is shown.
 const progressEvery = 60 * time.Millisecond
 
-// Config sets up an Agent.
+// Config sets up an Agent. Set Provider (DSML web chat) or Native (API tool
+// calling), not both: they are two separate paths. If both are set, Native wins.
 type Config struct {
-	Provider    Provider
-	Tools       *tools.Registry
-	System      string        // Kai's own instructions, sent with the first message
-	Thinking    bool          // ask the model to reason
-	MaxSteps    int           // model turns per Run (default 30)
-	MaxRepairs  int           // retries for unreadable tool calls per Run (default 2)
-	ToolTimeout time.Duration // per tool call (default 60s)
-	Record      func(Entry)   // called for every history entry (session log); may be nil
+	Provider Provider       // DSML path: DeepSeek Web
+	Native   NativeProvider // native path: OpenAI-compatible APIs
+	Tools    *tools.Registry
+
+	// System is Kai's instructions for the DSML path. It travels inside the
+	// first message, next to the DSML tool block.
+	System string
+	// NativeSystem is Kai's instructions for the native path. It is the
+	// API's system message; it never contains tool-call markup, because the
+	// tools travel as structured definitions. If empty, System is used.
+	NativeSystem string
+
+	Thinking        bool          // DSML path: ask the web chat to reason
+	MaxSteps        int           // model turns per Run (default 30)
+	MaxRepairs      int           // DSML path: retries for unreadable tool calls per Run (default 2)
+	MaxContextBytes int           // native path: conversation size kept and sent (default 600 KB, about 150k tokens)
+	ToolTimeout     time.Duration // per tool call (default 60s)
+	Record          func(Entry)   // called for every history entry (session log); may be nil
 }
 
 // Entry is one item of Kai's own record of the conversation (context #2).
@@ -52,6 +60,11 @@ type Agent struct {
 	recap   string // recap to put in front of the next first message, after a lost chat
 	history []Entry
 	tokens  int // estimate of what the current web chat holds
+
+	// Native path only. The API is stateless, so the agent owns the
+	// conversation and sends it all every time. The system message is not
+	// stored here; it is put in front when the request is built.
+	msgs []ChatMessage
 }
 
 func New(cfg Config) *Agent {
@@ -63,6 +76,9 @@ func New(cfg Config) *Agent {
 	}
 	if cfg.MaxRepairs <= 0 {
 		cfg.MaxRepairs = 2
+	}
+	if cfg.MaxContextBytes <= 0 {
+		cfg.MaxContextBytes = defaultMaxContextBytes
 	}
 	if cfg.ToolTimeout <= 0 {
 		cfg.ToolTimeout = 60 * time.Second
@@ -82,11 +98,12 @@ func newSessionID() string {
 func (a *Agent) Reset(ctx context.Context) {
 	a.mu.Lock()
 	a.parent, a.started, a.recap, a.history = nil, false, "", nil
+	a.msgs = nil
 	a.tokens = 0
 	a.session = newSessionID()
 	sess := a.session
 	a.mu.Unlock()
-	slog.Info("agent reset: next message opens a new web chat", "session", sess)
+	slog.Info("agent reset: next message opens a new chat", "session", sess)
 	if s, ok := a.provider().(Sessioner); ok {
 		_ = s.NewSession(ctx)
 	}
@@ -169,239 +186,22 @@ func (a *Agent) Run(ctx context.Context, user string) <-chan Event {
 	out := make(chan Event, 64)
 	go func() {
 		defer close(out)
-		a.loop(ctx, user, func(e Event) bool {
+		emit := func(e Event) bool {
 			select {
 			case out <- e:
 				return true
 			case <-ctx.Done():
 				return false
 			}
-		})
+		}
+		// Two separate paths; the backend decides which one runs.
+		if a.nativeProvider() != nil {
+			a.loopNative(ctx, user, emit)
+		} else {
+			a.loopWeb(ctx, user, emit)
+		}
 	}()
 	return out
-}
-
-// prepare wraps body for sending. The first message of a chat also carries
-// Kai's instructions and the tool block (the web chat has no system role).
-// After a lost chat it carries a recap of the conversation too.
-func (a *Agent) prepare(body string) string {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.started {
-		return body
-	}
-	if a.recap != "" {
-		body = "The earlier chat was lost, so this is a fresh chat. Recap of the conversation so far:\n\n" +
-			a.recap + "\n\nContinue from here.\n\n" + body
-	}
-	return dsml.FirstPrompt(a.cfg.System, a.cfg.Tools.Specs(), body)
-}
-
-// restartChat drops the web chat's position and prepares a recap from Kai's
-// own record, so the next message opens a new chat that knows what happened.
-func (a *Agent) restartChat() {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.parent, a.started = nil, false
-	a.tokens = 0 // the new chat starts empty
-	a.session = newSessionID()
-	a.recap = recap(a.history, recapBudget)
-	slog.Warn("web chat lost: starting a new chat with a recap", "session", a.session)
-}
-
-func (a *Agent) loop(ctx context.Context, user string, emit func(Event) bool) {
-	a.record("user", user, "")
-	body := user // what to say next, without Kai's instructions
-	repairs := 0
-	recovered := false
-
-	for step := 0; step < a.cfg.MaxSteps; step++ {
-		res, err := a.turn(ctx, a.prepare(body), emit)
-		if ctx.Err() != nil {
-			return // stopped by the user
-		}
-		if errors.Is(err, ErrChatLost) && !recovered {
-			recovered = true // once per request, so a broken bridge cannot loop forever
-			a.restartChat()
-			step-- // this attempt does not count
-			continue
-		}
-		if err != nil {
-			slog.Error("agent turn failed", "step", step, "err", err)
-			emit(Event{Kind: EvError, Err: err})
-			return
-		}
-		if res.text != "" {
-			a.record("assistant", res.text, "")
-		}
-
-		if len(res.calls) == 0 {
-			if res.problem == "" {
-				emit(Event{Kind: EvDone})
-				return
-			}
-			if repairs >= a.cfg.MaxRepairs {
-				emit(Event{Kind: EvError, Err: fmt.Errorf("the model kept sending unreadable tool calls: %s", res.problem)})
-				return
-			}
-			repairs++
-			body = dsml.RepairPrompt(res.problem)
-			continue
-		}
-
-		results := make([]tools.Result, 0, len(res.calls))
-		for i := range res.calls {
-			c := res.calls[i]
-			if !emit(Event{Kind: EvToolCall, Call: &c}) {
-				return
-			}
-			r := a.cfg.Tools.Execute(ctx, c, a.cfg.ToolTimeout)
-			if ctx.Err() != nil {
-				return
-			}
-			if !emit(Event{Kind: EvToolResult, Call: &c, Result: &r}) {
-				return
-			}
-			a.record("tool", r.Output, "")
-			results = append(results, r)
-		}
-		body = dsml.EncodeResults(results)
-	}
-	emit(Event{Kind: EvError, Err: fmt.Errorf("stopped after %d steps without a final answer", a.cfg.MaxSteps)})
-}
-
-type turnResult struct {
-	text    string       // visible text of the reply
-	calls   []tools.Call // tool calls found in it
-	problem string       // why the reply's tool call could not be read ("" if fine)
-}
-
-// turn sends one prompt and reads the whole reply, forwarding text and
-// thinking as they arrive.
-func (a *Agent) turn(ctx context.Context, prompt string, emit func(Event) bool) (turnResult, error) {
-	var res turnResult
-
-	parent, session, newChat := a.chatState()
-	slog.Info("agent turn", "session", session, "newChat", newChat, "hasParent", parent != nil, "promptBytes", len(prompt))
-	stream, err := a.provider().Send(ctx, Turn{
-		Prompt:   prompt,
-		ParentID: parent,
-		Thinking: a.cfg.Thinking,
-		Session:  session,
-		NewChat:  newChat,
-	})
-	if err != nil {
-		return res, err
-	}
-
-	// The usage gauge follows what the provider actually sees and writes: the
-	// prompt (instructions and tool specs included, on the first turn) plus
-	// every delta the model streams, markup and all.
-	used := -1
-	usage := func(force bool) {
-		tok := a.tokensNow()
-		if tok == used || (!force && tok-used < 40) {
-			return
-		}
-		used = tok
-		emit(Event{Kind: EvUsage, Tokens: tok})
-	}
-	a.addTokens(EstimateTokens(prompt))
-	usage(true)
-
-	var text strings.Builder
-	show := func(s string) bool {
-		if s == "" {
-			return true
-		}
-		text.WriteString(s)
-		return emit(Event{Kind: EvText, Text: s})
-	}
-
-	p := dsml.NewParser()
-	ended := false
-	var prog *ToolProgress // last progress reported for the call being written
-	var progAt time.Time   // when it was reported
-	var seen *ToolProgress // newest progress computed, reported or not
-
-read:
-	for {
-		select {
-		case <-ctx.Done():
-			return res, ctx.Err()
-		case ev, ok := <-stream:
-			if !ok {
-				break read
-			}
-			switch ev.Kind {
-			case StreamSent:
-				a.markStarted()
-			case StreamReady:
-				a.setParent(ev.MessageID)
-			case StreamThinking:
-				a.addTokens(EstimateTokens(ev.Text))
-				usage(false)
-				if !emit(Event{Kind: EvThinking, Text: ev.Text}) {
-					return res, ctx.Err()
-				}
-			case StreamText:
-				visible := p.Feed(ev.Text)
-				a.addTokens(EstimateTokens(ev.Text))
-				usage(false)
-				if tp, ok := p.Progress(); ok && tp.Name == "edit_file" {
-					hp := &ToolProgress{Name: tp.Name, Path: tp.Path, Lines: tp.Lines, Creating: tp.Creating}
-					// A new file or a change of kind is reported at once; a
-					// growing line count at most every progressEvery, so a
-					// long file does not flood the UI with events.
-					seen = hp
-					changed := prog == nil || prog.Name != hp.Name || prog.Path != hp.Path || prog.Creating != hp.Creating
-					// Growth of an eighth also counts, so a short file still
-					// shows its count climbing even on a very fast stream.
-					grew := !changed && hp.Lines-prog.Lines >= 1+prog.Lines/8
-					if changed || grew || (prog.Lines != hp.Lines && time.Since(progAt) >= progressEvery) {
-						prog, progAt = hp, time.Now()
-						if !emit(Event{Kind: EvToolProgress, Progress: hp}) {
-							return res, ctx.Err()
-						}
-					}
-				}
-				if !show(visible) {
-					return res, ctx.Err()
-				}
-			case StreamEnd:
-				ended = true
-				if st := ev.Text; st != "" && st != "FINISHED" {
-					return res, fmt.Errorf("the reply ended early (status %s)", st)
-				}
-			case StreamError:
-				if !ended {
-					if ev.Err == nil {
-						return res, errors.New("the stream failed")
-					}
-					return res, ev.Err
-				}
-			}
-		}
-	}
-	usage(true)
-	// The count the throttle held back is the final one: show it.
-	if seen != nil && (prog == nil || *seen != *prog) {
-		emit(Event{Kind: EvToolProgress, Progress: seen})
-	}
-
-	if !ended {
-		return res, errors.New("the reply stream closed before the reply was finished")
-	}
-	if !show(p.Finish()) {
-		return res, ctx.Err()
-	}
-
-	res.text = text.String()
-	res.calls = p.Calls()
-	if len(res.calls) == 0 && len(p.Warnings()) > 0 {
-		res.problem = strings.Join(p.Warnings(), "; ")
-	}
-	return res, nil
 }
 
 // provider is the provider in use right now (it can change with SetProvider).
@@ -411,20 +211,33 @@ func (a *Agent) provider() Provider {
 	return a.cfg.Provider
 }
 
-// SetProvider switches to another provider in the middle of a conversation.
-// Kai's own record of the conversation is kept: the next message opens a fresh
-// chat on the new provider and starts with a recap of it.
+// SetProvider switches to a DSML web-chat provider in the middle of a
+// conversation. Kai's own record of the conversation is kept: the next message
+// opens a fresh chat on the new provider and starts with a recap of it.
 func (a *Agent) SetProvider(p Provider) {
+	a.SetBackend(Backend{Web: p})
+}
+
+// SetNative switches to a native tool-calling provider, keeping the record
+// of the conversation like SetProvider does.
+func (a *Agent) SetNative(p NativeProvider) {
+	a.SetBackend(Backend{Native: p})
+}
+
+// SetBackend switches the path and provider. Exactly one of b.Web and
+// b.Native should be set; the other path is cleared so the two never mix.
+func (a *Agent) SetBackend(b Backend) {
 	a.mu.Lock()
-	a.cfg.Provider = p
+	a.cfg.Provider, a.cfg.Native = b.Web, b.Native
 	a.parent, a.started = nil, false
+	a.msgs = nil
 	a.tokens = 0
 	a.session = newSessionID()
 	a.recap = recap(a.history, recapBudget)
 	sess := a.session
 	a.mu.Unlock()
-	slog.Info("provider switched: next message opens a new chat with a recap", "session", sess)
-	if s, ok := p.(Sessioner); ok {
+	slog.Info("provider switched: next message opens a new chat with a recap", "session", sess, "native", b.Native != nil)
+	if s, ok := b.Web.(Sessioner); ok {
 		_ = s.NewSession(context.Background())
 	}
 }
@@ -434,6 +247,7 @@ func (a *Agent) SetProvider(p Provider) {
 func (a *Agent) Resume(h []Entry) {
 	a.mu.Lock()
 	a.parent, a.started = nil, false
+	a.msgs = nil
 	a.tokens = 0
 	a.session = newSessionID()
 	a.history = append([]Entry(nil), h...)
@@ -444,4 +258,43 @@ func (a *Agent) Resume(h []Entry) {
 	if s, ok := a.provider().(Sessioner); ok {
 		_ = s.NewSession(context.Background())
 	}
+}
+
+// nativeProvider is the native provider in use, or nil on the DSML path.
+func (a *Agent) nativeProvider() NativeProvider {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.cfg.Native
+}
+
+// progressGate decides when a growing tool-call progress is worth reporting.
+// A new file or a change of kind is reported at once; a growing line count at
+// most every progressEvery, so a long file does not flood the UI with events.
+// Both paths use it.
+type progressGate struct {
+	sent   *ToolProgress // last progress reported
+	sentAt time.Time     // when it was reported
+	latest *ToolProgress // newest progress seen, reported or not
+}
+
+// offer takes the newest progress and reports whether to show it now.
+func (g *progressGate) offer(hp *ToolProgress) bool {
+	g.latest = hp
+	changed := g.sent == nil || g.sent.Name != hp.Name || g.sent.Path != hp.Path || g.sent.Creating != hp.Creating
+	// Growth of an eighth also counts, so a short file still shows its count
+	// climbing even on a very fast stream.
+	grew := !changed && hp.Lines-g.sent.Lines >= 1+g.sent.Lines/8
+	if changed || grew || (g.sent.Lines != hp.Lines && time.Since(g.sentAt) >= progressEvery) {
+		g.sent, g.sentAt = hp, time.Now()
+		return true
+	}
+	return false
+}
+
+// pending is the final count the throttle held back, or nil if none.
+func (g *progressGate) pending() *ToolProgress {
+	if g.latest != nil && (g.sent == nil || *g.latest != *g.sent) {
+		return g.latest
+	}
+	return nil
 }

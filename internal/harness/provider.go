@@ -3,6 +3,8 @@ package harness
 import (
 	"context"
 	"errors"
+
+	"kai/internal/tools"
 )
 
 // ErrChatLost means the chat on the provider side is gone or is no longer the
@@ -32,6 +34,7 @@ const (
 	StreamError                          // the stream failed; Err says why
 	StreamSent                           // the prompt reached the web chat (the chat now exists)
 	StreamToolProgress                   // a tool call is still being written; Tool says which
+	StreamToolCall                       // a complete native tool call (native providers only); ToolCall holds it
 )
 
 // ToolProgress is a tool call as it is being written: the model has sent the
@@ -49,9 +52,14 @@ type StreamEvent struct {
 	Text      string
 	MessageID int
 	Tool      *ToolProgress // StreamToolProgress
+	ToolCall  *ToolCall     // StreamToolCall
 	Err       error
 }
 
+// Provider is the DSML path: a web chat that has no system role and no native
+// tools. The agent sends it text prompts and finds tool calls in the reply
+// with the dsml parser. Only DeepSeek Web uses it.
+//
 // Provider sends a Turn and streams the reply back. The returned channel must
 // be closed when the reply is over or ctx is cancelled.
 type Provider interface {
@@ -61,4 +69,49 @@ type Provider interface {
 // Sessioner is implemented by providers that can start a fresh chat.
 type Sessioner interface {
 	NewSession(ctx context.Context) error
+}
+
+// ---- native tool calling ---------------------------------------------------
+//
+// NativeProvider is the other path, used by OpenAI-compatible APIs. It shares
+// nothing with the DSML path: the API gets a real system message, the tools as
+// structured definitions, and answers with structured tool calls, so there is
+// no DSML in the prompt, no DSML parser on the reply, and the results go back
+// as "tool" messages instead of <tool_result> text.
+
+// ToolCall is one tool call the model made through the API. Arguments is the
+// JSON text exactly as the model wrote it; the agent parses it.
+type ToolCall struct {
+	ID        string
+	Name      string
+	Arguments string
+}
+
+// ChatMessage is one message of an API conversation.
+type ChatMessage struct {
+	Role       string     // "system", "user", "assistant" or "tool"
+	Content    string     //
+	Reasoning  string     // assistant: the model's reasoning, echoed back only while a request is running
+	ToolCalls  []ToolCall // assistant: the calls it made
+	ToolCallID string     // tool: the call this message answers
+}
+
+// ChatRequest is the whole conversation. Native providers are stateless: the
+// agent owns the history and sends all of it every time.
+type ChatRequest struct {
+	Messages []ChatMessage // the first one is the system message
+	Tools    []tools.Spec
+}
+
+// NativeProvider streams the reply to a ChatRequest. Tool calls arrive as
+// StreamToolCall events (after the reply text), never as text. The channel
+// must be closed when the reply is over or ctx is cancelled.
+type NativeProvider interface {
+	Chat(ctx context.Context, req ChatRequest) (<-chan StreamEvent, error)
+}
+
+// Backend is what an Agent talks to: exactly one of the two paths.
+type Backend struct {
+	Web    Provider       // DSML text protocol (DeepSeek Web)
+	Native NativeProvider // API tool calling (custom OpenAI-compatible providers)
 }
