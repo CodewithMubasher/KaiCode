@@ -47,8 +47,19 @@ type runState struct {
 	thinkAt time.Time
 	tokens  int
 
+	// pending is the batch of tool calls that have been announced and have
+	// not returned yet. Their results are drawn in call order; until then one
+	// transient line says what is running.
+	pending []pendingCall
+
 	savedTokens int
 	savedAt     time.Time
+}
+
+type pendingCall struct {
+	id    string
+	label string
+	call  tools.Call
 }
 
 type (
@@ -151,6 +162,7 @@ func (m Model) startRun(text string) (Model, tea.Cmd) {
 	m.run.cancel = cancel
 	m.run.events = m.agent().Run(ctx, text)
 	m.run.thinkAt = time.Time{}
+	m.run.pending = nil
 	return m, waitEvent(m.run.id, m.run.events)
 }
 
@@ -163,6 +175,7 @@ func (m Model) stopRun() Model {
 	}
 	m.run.id++
 	m.run.events = nil
+	m.run.pending = nil
 	return m
 }
 
@@ -229,34 +242,25 @@ func (m Model) applyEvent(ev harness.Event) Model {
 		if ev.Call == nil {
 			break
 		}
-		switch ev.Call.Name {
-		case "read_file":
-			path, _ := tools.StringArg(ev.Call.Args, "path")
-			m.chat = m.chat.ReadFile(path)
-		case "edit_file":
-			path, _ := tools.StringArg(ev.Call.Args, "path")
-			old, _ := tools.StringArg(ev.Call.Args, "old_string")
-			body, _ := tools.StringArg(ev.Call.Args, "new_string")
-			m.chat = m.chat.WriteProgress("edit_file", path, countLines(body), strings.TrimSpace(old) == "")
-		case "create_file":
-			path, _ := tools.StringArg(ev.Call.Args, "path")
-			body, _ := tools.StringArg(ev.Call.Args, "content")
-			m.chat = m.chat.WriteProgress("create_file", path, countLines(body), true)
-		default:
-			// A running line, so a slow command is not a silent gap.
-			m.chat = m.chat.ShellStart(callLabel(*ev.Call))
-		}
+		// Nothing is drawn per call. The call joins the running batch, and
+		// its finished block is added, in call order, when its result comes.
+		pend := make([]pendingCall, len(m.run.pending), len(m.run.pending)+1)
+		copy(pend, m.run.pending)
+		m.run.pending = append(pend, pendingCall{id: ev.Call.ID, label: callLabel(*ev.Call), call: *ev.Call})
+		m = m.showPending()
 
 	case harness.EvToolResult:
 		if ev.Call == nil || ev.Result == nil {
 			break
 		}
-		// Whatever was showing "in progress" for this call ends now. Each
-		// result adds exactly one block to the timeline.
+		// Whatever was showing "in progress" ends now. Each result adds
+		// exactly one block to the timeline.
+		m = m.finishPending(*ev.Call)
 		m.chat = m.chat.EndWrite()
 		switch {
 		case ev.Call.Name == "read_file" && !ev.Result.IsError:
-			// Already on screen from its call.
+			path, _ := tools.StringArg(ev.Call.Args, "path")
+			m.chat = m.chat.ReadFile(path)
 		case ev.Call.Name == "edit_file" || ev.Call.Name == "create_file":
 			// A file step is a timeline node: the full content of a created
 			// file, or the diff of an edit. The tool's own result text (what
@@ -280,9 +284,11 @@ func (m Model) applyEvent(ev harness.Event) Model {
 			}
 			m.chat = m.chat.RunShell(callLabel(*ev.Call), out)
 		}
+		m = m.showPending() // the rest of the batch is still running
 
 	case harness.EvDone:
 		m = m.endThinking()
+		m.run.pending = nil
 		m.chat = m.chat.EndWrite()
 		m.chat = m.chat.EndAnswer()
 		m = m.saveTokens(true)
@@ -290,6 +296,7 @@ func (m Model) applyEvent(ev harness.Event) Model {
 
 	case harness.EvError:
 		m = m.endThinking()
+		m.run.pending = nil
 		m = m.saveTokens(true)
 		msg := "request failed"
 		if ev.Err != nil {
@@ -300,6 +307,67 @@ func (m Model) applyEvent(ev harness.Event) Model {
 		}
 		m.chat = m.chat.Fail(msg)
 		m = m.saveState()
+	}
+	return m
+}
+
+// finishPending takes a returned call out of the running batch.
+func (m Model) finishPending(c tools.Call) Model {
+	label := callLabel(c)
+	idx := -1
+	for i, p := range m.run.pending {
+		if (c.ID != "" && p.id == c.ID) || (c.ID == "" && p.label == label) {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		for i, p := range m.run.pending {
+			if p.label == label {
+				idx = i
+				break
+			}
+		}
+	}
+	if idx < 0 {
+		return m
+	}
+	rest := make([]pendingCall, 0, len(m.run.pending)-1)
+	rest = append(rest, m.run.pending[:idx]...)
+	rest = append(rest, m.run.pending[idx+1:]...)
+	m.run.pending = rest
+	return m
+}
+
+// showPending draws the one transient line for calls that have not returned:
+// the call itself when there is one, a short summary when there are several.
+// It replaces whatever transient line was there, so the timeline never gains
+// or loses rows except when a result arrives.
+func (m Model) showPending() Model {
+	m.chat = m.chat.EndWrite()
+	switch n := len(m.run.pending); {
+	case n == 0:
+	case n == 1:
+		c := m.run.pending[0].call
+		switch c.Name {
+		case "edit_file":
+			path, _ := tools.StringArg(c.Args, "path")
+			old, _ := tools.StringArg(c.Args, "old_string")
+			body, _ := tools.StringArg(c.Args, "new_string")
+			m.chat = m.chat.WriteProgress("edit_file", path, countLines(body), strings.TrimSpace(old) == "")
+		case "create_file":
+			path, _ := tools.StringArg(c.Args, "path")
+			body, _ := tools.StringArg(c.Args, "content")
+			m.chat = m.chat.WriteProgress("create_file", path, countLines(body), true)
+		default:
+			m.chat = m.chat.ShellStart(m.run.pending[0].label)
+		}
+	default:
+		labels := make([]string, 0, len(m.run.pending))
+		for _, p := range m.run.pending {
+			labels = append(labels, p.label)
+		}
+		m.chat = m.chat.ShellStart(fmt.Sprintf("%d tools in parallel: %s", len(labels), strings.Join(labels, ", ")))
 	}
 	return m
 }
@@ -395,6 +463,14 @@ func textLines(s string) []string {
 
 func callLabel(c tools.Call) string {
 	switch c.Name {
+	case "read_file":
+		if p, _ := c.Args["path"].(string); p != "" {
+			return clipLine("read " + p)
+		}
+	case "create_file":
+		if p, _ := c.Args["path"].(string); p != "" {
+			return clipLine("create " + p)
+		}
 	case "shell":
 		if cmd, _ := c.Args["command"].(string); strings.TrimSpace(cmd) != "" {
 			return clipLine(cmd)

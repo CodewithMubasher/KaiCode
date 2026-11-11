@@ -6,32 +6,34 @@ import (
 	"kai/internal/tools"
 )
 
+// toolsIntro teaches a web chat the strict JSON calling format. The chat has
+// no tool API, so everything the model needs to know is in this text.
 const toolsIntro = `## Tools
 
-You can call tools. To call one, first write one short sentence that says why (it is shown to the user), then a single block in exactly this format:
+You can call tools. To call tools, first write one short sentence that says why (the reason is shown to the user), then put every call in a block in exactly this format:
 
 <tool_call>
 {"name":"read_file","arguments":{"path":"src/main.go"}}
 </tool_call>
 
 Rules:
-- The block holds exactly one JSON object with two keys: "name" (the tool) and "arguments" (an object of parameter names and values).
-- Write valid JSON: strings in double quotes, numbers and booleans as JSON values, arrays and objects nested normally.
-- Copy the tags exactly: "<tool_call>" on its own line, then the JSON, then "</tool_call>". Never write a partial tag or a bare JSON object as ordinary text.
-- Write one short reason sentence before every block, for example: I'll read the config to find the port.
-- You may call several tools: put each call in its own <tool_call> block, each with its own reason sentence, one after another.
+- The block holds JSON only: an object with "name" (the tool name) and "arguments" (an object). No Markdown fence, no comments, no text inside the block.
+- PARALLEL TOOL CALLING IS THE PRIORITY. When you need more than one tool and the calls do not depend on each other, send ALL of them in the same reply, one <tool_call> block each (or several JSON objects in one block). They run at the same time and all results come back together. Read several files at once, run independent commands at once, create several files at once. Only send a call alone when it needs the result of an earlier call.
+- Calls that touch the same file run in the order you wrote them, so you may safely create a file and edit it in the same reply.
 - Write nothing after the last </tool_call>. Stop and wait: the results arrive in the next message, each inside <tool_result> tags, in the same order as your calls.
-- The tools shell, read_file, create_file and edit_file are ALWAYS available. Never tell the user that a tool is missing or unavailable, and never invent extra tools.
-- Only use the exact tool names and parameter names defined below.
-- Every required parameter must be present in every call.
+- Copy the tags exactly: <tool_call> to open and </tool_call> to close, in ASCII, never <tool_calls> and never with "|" bars.
+- Strings in JSON must be escaped: use \n for a new line and \" for a quote. File contents go in the "content" or "new_string" string.
+- Only use the tools and parameters defined below.
+- shell, read_file, create_file and edit_file are ALWAYS available. Never tell the user that a tool is missing or unavailable, and never invent extra tools.
+- When the task is finished, reply normally without a <tool_call> block.
 - A result that starts with "Error:" means the call FAILED. Read the message (it shows the correct usage), fix the call, and never send the same call again unchanged.
-- When the task is finished, answer normally in plain text with no tool_call block.
+- Every required parameter must be present in every call, spelled exactly as defined below.
 
 ### Available tools
 `
 
-// ToolsPrompt is the instruction block that teaches the strict JSON calling
-// format and lists every tool with its schema and an example.
+// ToolsPrompt is the instruction block that teaches the model the JSON
+// calling format and lists the available tools.
 func ToolsPrompt(specs []tools.Spec) string {
 	var b strings.Builder
 	b.WriteString(toolsIntro)
@@ -47,13 +49,10 @@ func ToolsPrompt(specs []tools.Spec) string {
 	return b.String()
 }
 
-// exampleCall shows one valid call of the tool, using the parameters' example
-// values, preceded by the reason sentence the model must also write.
+// exampleCall shows one valid call of the tool, built from the parameters'
+// example values, so the model sees the exact parameter names it must use.
 func exampleCall(s tools.Spec) string {
-	return "I'll call " + s.Name + ".\n" +
-		"<tool_call>\n" +
-		`{"name":"` + s.Name + `","arguments":` + s.ExampleArgs() + "}\n" +
-		"</tool_call>"
+	return "<tool_call>\n{\"name\":\"" + s.Name + "\",\"arguments\":" + s.ExampleArgs() + "}\n</tool_call>"
 }
 
 // FirstPrompt builds the first message of a web-chat session. The web chat has
@@ -73,9 +72,10 @@ func FirstPrompt(system string, specs []tools.Spec, user string) string {
 }
 
 // EncodeResults is the next message after tool calls: one <tool_result> per
-// call, in call order, each named after its tool, followed by a reminder of
-// the protocol and the available tools. A web chat sees this as an ordinary
-// user message, so the note says what it is and that the task goes on.
+// call, in call order, each named after its tool, followed by a short note on
+// what to do next. A web chat sees this as an ordinary user message, so the
+// note says what it is and that the task goes on: without it a model may
+// answer the text instead of carrying on, or repeat a call that already worked.
 func EncodeResults(rs []tools.Result, specs []tools.Spec) string {
 	parts := make([]string, 0, len(rs))
 	failed := false
@@ -93,24 +93,24 @@ func EncodeResults(rs []tools.Result, specs []tools.Spec) string {
 		parts = append(parts, "<tool_result"+attr+">\n"+out+"\n</tool_result>")
 	}
 	note := "The results above come from your tool calls, run on the user's machine. " +
-		"Continue the task: if you need another tool, write one short reason sentence and then one <tool_call> block in the JSON format; " +
-		"if the task is finished, answer the user in plain text with no tool_call. " +
+		"Continue the task: if you need more, send tool calls in the <tool_call> JSON format, " +
+		"and send every independent call together in one reply; " +
+		"if the task is finished, answer the user in plain text with no tool call. " +
 		"Do not repeat a call that already succeeded."
 	if failed {
 		note = `A call FAILED (status="error"). Read its error, fix the call, and do not send it again unchanged. ` + note
 	}
+	msg := strings.Join(parts, "\n") + "\n\n" + note
 	if len(specs) > 0 {
-		note += "\n\nThese tools are always available; never say one is missing:\n" + tools.Manifest(specs)
+		msg += "\n\nThese tools are always available; never say one is missing:\n" + tools.Manifest(specs)
 	}
-	return strings.Join(parts, "\n") + "\n\n" + note
+	return msg
 }
 
 // RepairPrompt asks the model to resend a tool call that could not be read.
 func RepairPrompt(reason string) string {
 	return "Your last reply could not be executed: " + reason + ".\n" +
-		"Send the tool call again: one short reason sentence, then exactly this format, with nothing after the closing tag:\n" +
-		"<tool_call>\n" +
-		`{"name":"TOOL_NAME","arguments":{"PARAMETER_NAME":"VALUE"}}` + "\n" +
-		"</tool_call>\n" +
-		"all four tools (shell, read_file, create_file, edit_file) are always available. Never write raw or partial markup."
+		"Send the tool call again using exactly this format, with nothing after the closing tag:\n" +
+		"<tool_call>\n{\"name\":\"TOOL_NAME\",\"arguments\":{\"PARAM\":\"VALUE\"}}\n</tool_call>\n" +
+		"The block must hold valid JSON only. Remember that all four tools (shell, read_file, create_file, edit_file) are always available."
 }

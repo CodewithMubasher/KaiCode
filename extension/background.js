@@ -37,60 +37,17 @@ const outbox = new Map();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const errText = (e) => String((e && e.message) || e);
 
-// ---- logging -----------------------------------------------------------------
-// Kept in memory, saved to chrome.storage (so it survives the worker being
-// suspended), downloadable from the popup, and shipped to Kai, which writes it
-// into logs.txt next to its own lines.
-
-const MAX_LOG = 1000;
-let logBuf = [];
-let pending = [];
-let dirty = false;
-
-const logsReady = chrome.storage.local.get('logs').then((s) => {
-  if (Array.isArray(s.logs)) logBuf = s.logs.concat(logBuf).slice(-MAX_LOG);
-});
-
-function log(level, msg, src = 'bg') {
-  const line = { t: Date.now(), src, lvl: level, msg: String(msg) };
-  logBuf.push(line);
-  if (logBuf.length > MAX_LOG) logBuf.shift();
-  pending.push(line);
-  if (pending.length > 300) pending.shift();
-  dirty = true;
-}
-
-const fmt = (l) => `${new Date(l.t).toISOString()} [${l.src}] ${l.lvl.toUpperCase()} ${l.msg}`;
-
-async function saveAndShip() {
-  if (dirty) {
-    dirty = false;
-    await logsReady;
-    chrome.storage.local.set({ logs: logBuf }).catch(() => {});
-  }
-  if (connected && pending.length) {
-    const batch = pending.splice(0, pending.length);
-    try {
-      const { addr } = await settings();
-      const r = await fetch(`${addr}/v1/log`, {
-        method: 'POST',
-        headers: { ...HEADERS, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ lines: batch }),
-      });
-      if (!r.ok) pending.unshift(...batch);
-    } catch (_) {
-      pending.unshift(...batch);
-    }
-  }
-}
-setInterval(saveAndShip, 1500);
-
 // ---- settings ----------------------------------------------------------------
 
+// The address is read from storage once and kept: every chunk of a reply goes
+// through here, and a storage read per chunk is latency for nothing.
+let cachedAddr = null;
 async function settings() {
+  if (cachedAddr) return { addr: cachedAddr };
   const s = await chrome.storage.local.get(['addr']);
   let addr = (s.addr || DEFAULT_ADDR).trim().replace(/\/+$/, '');
   if (!/^https?:\/\//.test(addr)) addr = 'http://' + addr;
+  cachedAddr = addr;
   return { addr };
 }
 
@@ -103,7 +60,6 @@ function setState(ok, error) {
   const key = ok ? 'ok' : 'bad:' + lastError;
   if (key !== lastStateKey) {
     lastStateKey = key;
-    log(ok ? 'info' : 'warn', ok ? 'connected to Kai' : `not connected to Kai: ${lastError}`);
   }
 }
 
@@ -135,7 +91,6 @@ function noteUrl(tabId, url) {
   if (!isChatPath(pathOf(url))) return;
   chat.url = url;
   persistChat();
-  log('info', `this session's chat is ${url}`);
 }
 chrome.tabs.onUpdated.addListener((tabId, info) => {
   if (info.url) noteUrl(tabId, info.url);
@@ -151,17 +106,16 @@ function noteChatId(tabId, chatId, host) {
   if (chat.url === url) return;
   chat.url = url;
   persistChat();
-  log('info', `this session's chat is ${url} (named by the completion request)`);
 }
 
 // Qwen moves the tab from "/" to "/c/<id>" a moment after a new chat's first
 // reply ends. A tool result sent in that gap used to be typed into the home page
 // and ended up in a new chat. Give the page a moment to arrive.
 async function settleOnChat(tab, url) {
-  for (let i = 0; i < 12 && pathOf(tab.url) === '/'; i++) {
-    await sleep(500);
+  for (let i = 0; i < 40 && pathOf(tab.url) === '/'; i++) {
+    await sleep(150);
     tab = await chrome.tabs.get(tab.id);
-    if (pathOf(tab.url) === pathOf(url)) log('info', `the tab arrived at ${pathOf(url)}`);
+    if (pathOf(tab.url) === pathOf(url)) break;
   }
   return tab;
 }
@@ -205,12 +159,10 @@ async function post(ev) {
     });
     if (!r.ok) {
       lastError = `Kai answered HTTP ${r.status}`;
-      log('warn', `event ${ev.type} was refused: HTTP ${r.status}`);
     }
     return r.ok;
   } catch (e) {
     lastError = errText(e);
-    log('warn', `could not send event ${ev.type} to Kai: ${lastError}`);
     return false;
   }
 }
@@ -239,12 +191,10 @@ async function flush(o) {
         o.buf = '';
         o.chunks++;
         o.bytes += data.length;
-        if (o.chunks === 1) log('info', `${o.id}: first reply data (${data.length} chars) goes to Kai`);
         await post({ id: o.id, type: 'chunk', data });
       } else {
         const final = o.final;
         o.final = null;
-        log('info', `${o.id}: ${final.type} after ${o.chunks} posts, ${o.bytes} chars${final.message ? ': ' + final.message : ''}`);
         await post(final);
         outbox.delete(o.id);
       }
@@ -258,7 +208,6 @@ async function flush(o) {
 
 function handleCommand(cmd) {
   if (cmd.type === 'cancel') {
-    log('info', `${cmd.id}: cancelled by Kai`);
     cancelled.add(cmd.id);
     outbox.delete(cmd.id);
     if (cancelled.size > 50) cancelled.delete(cancelled.values().next().value);
@@ -268,30 +217,19 @@ function handleCommand(cmd) {
 }
 
 async function runSend(cmd) {
-  log('info', `${cmd.id}: send received (${siteOf(cmd.site).host}, session ${cmd.session}, newChat=${cmd.newChat}, ${(cmd.prompt || '').length} chars)`);
   post({ id: cmd.id, type: 'accepted' });
   try {
     const prep = await prepareTab(cmd);
     if (prep.lost) {
-      log('warn', `${cmd.id}: chat lost: ${prep.lost}`);
       await post({ id: cmd.id, type: 'chat_lost', message: prep.lost });
       return;
     }
-    let res;
-    try {
-      res = await sendToTab(prep.tab.id, { type: 'send', id: cmd.id, prompt: cmd.prompt }, siteOf(cmd.site));
-    } finally {
-      await detachDebugger(prep.tab.id);
-    }
+    const res = await sendToTab(prep.tab.id, { type: 'send', id: cmd.id, prompt: cmd.prompt }, siteOf(cmd.site));
     if (!res || !res.ok) {
       const message = (res && res.error) || `the ${siteOf(cmd.site).name} page did not respond`;
-      log('error', `${cmd.id}: could not send: ${message}`);
       await post({ id: cmd.id, type: 'error', message });
-    } else {
-      log('info', `${cmd.id}: the page sent the message`);
     }
   } catch (e) {
-    log('error', `${cmd.id}: ${errText(e)}`);
     await post({ id: cmd.id, type: 'error', message: errText(e) });
   }
 }
@@ -302,14 +240,12 @@ async function findTab(site) {
 }
 
 async function openTab(url, site) {
-  log('info', `opening ${url} in a new tab`);
   const tab = await chrome.tabs.create({ url, active: false });
   await waitLoaded(tab.id, site);
   return chrome.tabs.get(tab.id);
 }
 
 async function navigate(tabId, url, site) {
-  log('info', `tab ${tabId}: going to ${url}`);
   const loaded = waitLoaded(tabId, site);
   await chrome.tabs.update(tabId, { url });
   await loaded;
@@ -344,7 +280,6 @@ async function prepareTab(cmd) {
     if (site.chatUrl) tab = await settleOnChat(tab, chat.url);
   }
   if (tab && chat.url && pathOf(tab.url) !== pathOf(chat.url)) {
-    log('info', `the tab left Kai's chat (${pathOf(tab.url)}): going back`);
     tab = await navigate(tab.id, chat.url, site);
   } else if (!chat.url && isChatPath(pathOf(tab.url))) {
     chat.url = tab.url;
@@ -377,10 +312,8 @@ async function injectInto(tabId) {
   try {
     await chrome.scripting.executeScript({ target: { tabId }, files: ['inject.js'], world: 'MAIN' });
     await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
-    log('info', `tab ${tabId}: scripts injected`);
     return true;
   } catch (e) {
-    log('error', `tab ${tabId}: could not inject scripts: ${errText(e)}`);
     return false;
   }
 }
@@ -394,136 +327,18 @@ async function injectAll() {
 
 async function sendToTab(tabId, msg, site) {
   let injected = false;
-  for (let i = 0; i < 24; i++) {
+  for (let i = 0; i < 60; i++) {
     try {
       return await chrome.tabs.sendMessage(tabId, msg);
     } catch (e) {
-      if (i === 2 && !injected) {
-        log('warn', `tab ${tabId} does not answer (${errText(e)}): injecting scripts`);
+      if (i === 3 && !injected) {
         injected = await injectInto(tabId);
       }
-      await sleep(500);
+      await sleep(200);
     }
   }
   throw new Error(`could not reach the ${site.name} page: reload the ${site.host} tab and try again`);
 }
-
-// ---- trusted input ------------------------------------------------------------
-// content.js uses dispatchEvent()/el.click(), which produce isTrusted === false.
-// The debugger protocol drives Chrome's own input pipeline instead, so the page
-// receives the same kind of events a real user produces. It needs the
-// "debugger" permission and cannot attach while DevTools is open on that tab;
-// content.js then falls back to the DOM path.
-
-const TRUSTED_IDLE = 5000;
-const debugging = new Map(); // tabId -> { timer }
-
-async function debugSend(tabId, method, params) {
-  if (!chrome.debugger) throw new Error('the debugger permission is not active: reload the extension');
-  let d = debugging.get(tabId);
-  if (!d) {
-    await chrome.debugger.attach({ tabId }, '1.3');
-    d = { timer: null };
-    debugging.set(tabId, d);
-    log('info', `tab ${tabId}: trusted input attached`);
-  }
-  if (d.timer) {
-    clearTimeout(d.timer);
-    d.timer = null;
-  }
-  try {
-    return await chrome.debugger.sendCommand({ tabId }, method, params);
-  } finally {
-    d.timer = setTimeout(() => detachDebugger(tabId), TRUSTED_IDLE);
-  }
-}
-
-async function detachDebugger(tabId) {
-  const d = debugging.get(tabId);
-  if (!d) return;
-  if (d.timer) clearTimeout(d.timer);
-  debugging.delete(tabId);
-  try {
-    await chrome.debugger.detach({ tabId });
-  } catch (_) {
-    /* already gone (tab closed, worker suspended) */
-  }
-}
-
-async function trustedInput(msg, sender) {
-  const tabId = sender.tab && sender.tab.id;
-  if (tabId == null) return { ok: false, error: 'no tab' };
-  try {
-    switch (msg.op) {
-      case 'insertText':
-        if (typeof msg.text !== 'string') return { ok: false, error: 'no text' };
-        await debugSend(tabId, 'Input.insertText', { text: msg.text });
-        return { ok: true };
-      case 'key':
-        if (msg.key !== 'Enter') return { ok: false, error: `unsupported key ${msg.key}` };
-        await debugSend(tabId, 'Input.dispatchKeyEvent', {
-          type: 'keyDown',
-          key: 'Enter',
-          code: 'Enter',
-          windowsVirtualKeyCode: 13,
-          nativeVirtualKeyCode: 13,
-          text: '\r',
-          unmodifiedText: '\r',
-        });
-        await debugSend(tabId, 'Input.dispatchKeyEvent', {
-          type: 'keyUp',
-          key: 'Enter',
-          code: 'Enter',
-          windowsVirtualKeyCode: 13,
-          nativeVirtualKeyCode: 13,
-        });
-        return { ok: true };
-      case 'click': {
-        const x = Number(msg.x);
-        const y = Number(msg.y);
-        if (!Number.isFinite(x) || !Number.isFinite(y)) return { ok: false, error: 'bad click coordinates' };
-        await debugSend(tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
-        await debugSend(tabId, 'Input.dispatchMouseEvent', {
-          type: 'mousePressed',
-          x,
-          y,
-          button: 'left',
-          buttons: 1,
-          clickCount: 1,
-        });
-        await debugSend(tabId, 'Input.dispatchMouseEvent', {
-          type: 'mouseReleased',
-          x,
-          y,
-          button: 'left',
-          buttons: 0,
-          clickCount: 1,
-        });
-        return { ok: true };
-      }
-      default:
-        return { ok: false, error: `unknown operation ${msg.op}` };
-    }
-  } catch (e) {
-    return { ok: false, error: errText(e) };
-  }
-}
-
-if (chrome.debugger) {
-  chrome.debugger.onDetach.addListener((source, reason) => {
-    if (source.tabId == null) return;
-    const d = debugging.get(source.tabId);
-    if (d && d.timer) clearTimeout(d.timer);
-    debugging.delete(source.tabId);
-    log('info', `tab ${source.tabId}: trusted input detached (${reason})`);
-  });
-}
-
-chrome.tabs.onRemoved.addListener((tabId) => {
-  const d = debugging.get(tabId);
-  if (d && d.timer) clearTimeout(d.timer);
-  debugging.delete(tabId);
-});
 
 // ---- self-test (popup button) --------------------------------------------------
 
@@ -531,7 +346,6 @@ async function selfTest() {
   const out = [];
   const add = (ok, msg) => {
     out.push((ok ? 'OK    ' : 'FAIL  ') + msg);
-    log(ok ? 'info' : 'warn', `self-test: ${msg}`);
   };
   try {
     const { addr } = await settings();
@@ -556,17 +370,6 @@ async function selfTest() {
 
 async function selfTestSite(site, tab, add) {
   add(true, `${site.name} tab found (${pathOf(tab.url) || '/'})`);
-  if (chrome.debugger) {
-    try {
-      await chrome.debugger.attach({ tabId: tab.id }, '1.3');
-      await chrome.debugger.detach({ tabId: tab.id });
-      add(true, `${site.name}: trusted input is available (debugger protocol)`);
-    } catch (e) {
-      add(false, `${site.name}: trusted input unavailable (${errText(e)}): Kai will use DOM events`);
-    }
-  } else {
-    add(false, 'trusted input unavailable: the debugger permission is missing');
-  }
   let probe = null;
   for (let attempt = 0; attempt < 2 && !probe; attempt++) {
     try {
@@ -605,11 +408,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     case 'sse_error':
       enqueue(msg.id, { error: msg.message });
       return;
-    case 'trusted':
-      trustedInput(msg, sender).then(sendResponse);
-      return true;
     case 'sent':
-      log('info', `${msg.id}: the page started the completion request`);
       post({ id: msg.id, type: 'sent' });
       return;
     case 'chat_id':
@@ -617,18 +416,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return;
     case 'page_url':
       if (sender.tab) noteUrl(sender.tab.id, msg.url);
-      return;
-    case 'log':
-      log(msg.level || 'info', msg.msg, msg.src || 'page');
-      return;
-    case 'get_logs':
-      logsReady.then(() => sendResponse({ text: logBuf.map(fmt).join('\n') + '\n' }));
-      return true;
-    case 'clear_logs':
-      logBuf = [];
-      pending = [];
-      chrome.storage.local.remove('logs');
-      sendResponse({});
       return;
     case 'self_test':
       selfTest().then((lines) => sendResponse({ lines }));
@@ -638,18 +425,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 // ---- keep the worker alive -----------------------------------------------------
 
-chrome.alarms.create('kai-wake', { periodInMinutes: 0.5 });
+chrome.alarms.create('kai-wake', { periodInMinutes: 0.25 });
 chrome.alarms.onAlarm.addListener(() => pollLoop());
-setInterval(() => chrome.runtime.getPlatformInfo(() => {}), 20000);
+setInterval(() => chrome.runtime.getPlatformInfo(() => {}), 30000);
 chrome.runtime.onStartup.addListener(() => pollLoop());
 chrome.runtime.onInstalled.addListener((d) => {
-  log('info', `extension ${d.reason} (v${chrome.runtime.getManifest().version})`);
   injectAll();
   pollLoop();
 });
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area === 'local' && changes.addr) pollLoop();
+  if (area === 'local' && changes.addr) {
+    cachedAddr = null;
+    pollLoop();
+  }
 });
 
-log('info', `worker started (v${chrome.runtime.getManifest().version})`);
 pollLoop();

@@ -8,8 +8,7 @@
     "storage",
     "tabs",
     "alarms",
-    "scripting",
-    "debugger"
+    "scripting"
   ],
   "host_permissions": [
     "https://chat.deepseek.com/*",

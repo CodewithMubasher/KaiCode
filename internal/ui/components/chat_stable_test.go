@@ -296,8 +296,8 @@ func TestLongThoughtStaysBoundedWhileRunning(t *testing.T) {
 		t.Errorf("streaming a long thought took %v", d)
 	}
 	c = c.EndThinking(time.Minute)
-	if c.liveRowCount() != 1 {
-		t.Errorf("a finished thought should collapse to one line, got %d rows", c.liveRowCount())
+	if c.liveRowCount() != 0 {
+		t.Errorf("a finished thought must leave nothing in the timeline, got %d rows", c.liveRowCount())
 	}
 }
 
@@ -319,13 +319,15 @@ func TestResizeOfLongChatIsCached(t *testing.T) {
 
 func TestCollapseToggleOnOldMessage(t *testing.T) {
 	c := NewChat(80, 40)
-	c = c.AppendAssistantWithSteps("a", []Step{{Kind: StepThinking, Timeline: Timeline{Took: time.Second, Nodes: []TimelineNode{{Content: "secret reasoning"}}}}})
+	diff := []DiffLine{{Kind: DiffDel, Num: 1, Text: "secret old line"}, {Kind: DiffAdd, Num: 1, Text: "secret new line"}}
+	c = c.AppendAssistantWithSteps("a", []Step{{Kind: StepEdit, Path: "x.go", Diff: diff,
+		Timeline: FileTimeline("x.go", false, diff, "", false)}})
 	for i := 0; i < 5; i++ {
 		c = c.AppendUser("later")
 	}
 	c = c.SetSize(80, 40)
-	if !strings.Contains(c.View(), "secret reasoning") {
-		t.Fatal("expanded thought should be visible")
+	if !strings.Contains(c.View(), "secret new line") {
+		t.Fatal("an expanded edit should show its diff")
 	}
 	// find the heading row and click it
 	for y, r := range c.window() {
@@ -334,7 +336,7 @@ func TestCollapseToggleOnOldMessage(t *testing.T) {
 			break
 		}
 	}
-	if strings.Contains(c.View(), "secret reasoning") {
+	if strings.Contains(c.View(), "secret new line") {
 		t.Error("clicking the heading should collapse it")
 	}
 	assertLayout(t, c, "after click")

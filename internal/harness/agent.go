@@ -13,6 +13,11 @@ import (
 	"kai/internal/tools"
 )
 
+// defaultMaxSteps is how many model turns one request may take. Long coding
+// tasks read, write, build and fix for many rounds; with parallel tool calls
+// each round does much more, but the ceiling still has to be high.
+const defaultMaxSteps = 200
+
 // progressEvery is the longest a growing line count waits before it is shown.
 const progressEvery = 60 * time.Millisecond
 
@@ -32,8 +37,8 @@ type Config struct {
 	NativeSystem string
 
 	Thinking        bool          // DSML path: ask the web chat to reason
-	MaxSteps        int           // model turns per Run (default 30)
-	MaxRepairs      int           // DSML path: retries for unreadable tool calls per Run (default 2)
+	MaxSteps        int           // model turns per Run (default 200)
+	MaxRepairs      int           // web path: retries for unreadable tool calls per Run (default 3)
 	MaxContextBytes int           // native path: conversation size kept and sent (default 600 KB, about 150k tokens)
 	ToolTimeout     time.Duration // per tool call (default 60s)
 	Record          func(Entry)   // called for every history entry (session log); may be nil
@@ -73,10 +78,10 @@ func New(cfg Config) *Agent {
 		cfg.Tools = tools.NewRegistry()
 	}
 	if cfg.MaxSteps <= 0 {
-		cfg.MaxSteps = 30
+		cfg.MaxSteps = defaultMaxSteps
 	}
 	if cfg.MaxRepairs <= 0 {
-		cfg.MaxRepairs = 2
+		cfg.MaxRepairs = 3
 	}
 	if cfg.MaxContextBytes <= 0 {
 		cfg.MaxContextBytes = defaultMaxContextBytes

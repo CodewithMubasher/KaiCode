@@ -192,9 +192,9 @@ func codeNodeLines(lines []DiffLine, w int) []string {
 	return out
 }
 
-// FileTimeline is the timeline of a file step. A created file shows its full
-// content; an edit shows its diff. A failed step shows a one-line reason, not
-// the tool's result.
+// FileTimeline is the timeline of a file step. A created file shows only its
+// name (no content, not expandable); an edit shows a one-line diff preview.
+// A failed step shows a one-line reason, not the tool's result.
 func FileTimeline(path string, create bool, lines []DiffLine, fail string, collapsed bool) Timeline {
 	if path == "" {
 		path = "file"
@@ -207,14 +207,22 @@ func FileTimeline(path string, create bool, lines []DiffLine, fail string, colla
 		tl.Title = "Could not edit " + path
 	case create:
 		tl.Title = "Created " + path
+		// Deliberately do NOT add Lines nodes so the file content is not
+		// displayed or expandable in the timeline.
 	default:
 		tl.Title = "Edited " + path
 	}
 	switch {
 	case fail != "":
 		tl.Nodes = []TimelineNode{{Content: fail}}
-	case len(lines) > 0:
-		tl.Nodes = []TimelineNode{{Kind: NodeCode, Lines: lines}}
+		// When creating a file we suppress the code node so the diff is never
+		// rendered or expandable.
+	case create:
+		// no code node: file content stays hidden in the timeline
+	default:
+		if len(lines) > 0 {
+			tl.Nodes = []TimelineNode{{Kind: NodeCode, Lines: lines}}
+		}
 	}
 	return tl
 }

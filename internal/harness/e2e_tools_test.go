@@ -100,7 +100,7 @@ func TestAgentUsesShellAndEditFileEndToEnd(t *testing.T) {
 	if strings.Contains(p.sent[1], "kai_instructions") {
 		t.Errorf("instructions were repeated")
 	}
-	if !strings.Contains(p.sent[1], "<tool_result>") || !strings.Contains(p.sent[1], "main.go") || !strings.Contains(p.sent[1], "[exit code: 0]") {
+	if !strings.Contains(p.sent[1], "<tool_result") || !strings.Contains(p.sent[1], "main.go") || !strings.Contains(p.sent[1], "[exit code: 0]") {
 		t.Errorf("second message = %q", p.sent[1])
 	}
 	if !strings.Contains(p.sent[2], "Edited main.go") {

@@ -25,9 +25,15 @@ func (c ChatModel) Restore(msgs []Message) ChatModel {
 	for _, m := range msgs {
 		m.Text = cleanText(m.Text)
 		m.Steps = cloneSteps(m.Steps)
+		kept := m.Steps[:0]
 		for i := range m.Steps {
+			if m.Steps[i].Kind == StepThinking {
+				continue // thoughts are not part of the timeline any more
+			}
 			normalizeStep(&m.Steps[i])
+			kept = append(kept, m.Steps[i])
 		}
+		m.Steps = kept
 		c.messages = append(c.messages, m)
 	}
 	c.offset = 0
@@ -62,8 +68,7 @@ func normalizeStep(s *Step) {
 		s.Timeline.Collapsed = true
 		s.Timeline.Running = false
 	case StepThinking:
-		s.Timeline.Running = false
-		s.Timeline.Collapsed = true
+		s.Timeline = Timeline{Collapsed: true} // never shown; kept only so old saves load
 	}
 }
 

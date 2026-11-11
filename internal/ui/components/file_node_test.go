@@ -15,18 +15,25 @@ func fileLines() []DiffLine {
 	}
 }
 
-func TestCreatedFileStartsCollapsedAndOpensOnDemand(t *testing.T) {
+// A created file is only a heading: its content is never drawn and the node
+// cannot be opened, whatever state it is in.
+func TestCreatedFileShowsHeadingOnlyAndCannotOpen(t *testing.T) {
 	c := NewChat(100, 40).AppendUser("go").StartReply().EditFile("b.go", true, fileLines())
 	v := ansi.Strip(c.View())
 	if !strings.Contains(v, "Created b.go") || strings.Contains(v, "func B()") {
 		t.Fatalf("a created file should show its heading only:\n%s", v)
 	}
-	c.live.steps[len(c.live.steps)-1].hidden = false // what a click on the heading does
+	c.live.steps[len(c.live.steps)-1].hidden = false // even if it were "open"
 	c.live.steps[len(c.live.steps)-1].touch()
 	c.live.stepVer = nextVer()
 	v = ansi.Strip(c.View())
-	if !strings.Contains(v, "package b") || !strings.Contains(v, "func B() {}") {
-		t.Errorf("an opened node shows the whole file:\n%s", v)
+	if strings.Contains(v, "package b") || strings.Contains(v, "func B() {}") {
+		t.Errorf("a created file's content must never be shown:\n%s", v)
+	}
+	for y, r := range c.window() {
+		if r.head != headNone {
+			t.Errorf("row %d of a created file is clickable", y)
+		}
 	}
 }
 

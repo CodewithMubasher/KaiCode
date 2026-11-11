@@ -29,10 +29,7 @@ Set the page's DeepThink / Search toggles the way you want; Kai does not change 
 ## If something does not work
 
 - Click the extension icon → **Self-test**. It checks Kai, the tab, the page hook and the input box.
-- Everything is logged. Kai writes `~/.kai/logs.txt` (Windows: `C:\Users\<you>\.kai\logs.txt`) and the extension's lines go into the same file while Kai runs.
-  `kai logs` prints the path and the last lines. The popup also has **Download logs.txt** for the extension's own log.
-- The log shows each step of a message: queued → accepted by the extension → delivered to the web chat → first reply data → done.
-  The error in Kai tells you which step stalled.
+- The extension keeps no debug log (it slowed replies down). Kai's own log is `~/.kai/logs.txt`; `kai logs` prints its path and last lines.
 
 ## How it works
 

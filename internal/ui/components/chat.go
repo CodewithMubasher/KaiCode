@@ -39,6 +39,7 @@ const (
 	StepEdit
 	StepWriting
 	StepRunning // a command that has started and has not finished (live only)
+	StepNote    // the model's own words before a tool call: plain text, never a thought
 )
 
 type Step struct {
@@ -107,6 +108,8 @@ type liveStep struct {
 	name   string
 	create bool
 	lines  int
+
+	note string // StepNote: the text shown to the person
 
 	// rows is this step laid out at width rowsW; it is dropped whenever the
 	// step changes, so a finished step is rendered once, not once per token.
@@ -249,14 +252,22 @@ func capOutput(s string) string {
 	return head + "\n… " + itoa(len(s)-len(head)-len(tail)) + " bytes hidden …\n" + tail
 }
 
+// DemoteAnswer is called when the model starts a tool call. The sentence it
+// wrote before the call ("I'll read the config first") is the model talking to
+// the person, so it stays on screen as plain text, in order, above the tool
+// step. It is never turned into a thought.
 func (c ChatModel) DemoteAnswer() ChatModel {
 	if !c.active || c.live.answer.len() == 0 {
 		return c
 	}
-	c.live.steps = append(c.live.steps, liveStep{kind: StepThinking, think: c.live.answer, thinkDone: true, took: time.Second})
+	text := strings.TrimSpace(c.live.answer.String())
 	c.live.answer = textBuf{}
 	c.live.answerDone = false
 	c.live.answerGen++
+	if text != "" {
+		c = c.dropThought()
+		c.live.steps = append(c.live.steps, liveStep{kind: StepNote, note: text})
+	}
 	c.live.stepVer = nextVer()
 	return c
 }
@@ -266,11 +277,10 @@ func (c ChatModel) finish(stopped, dropEmpty bool) ChatModel {
 	l := c.live
 	msg := Message{Role: RoleAssistant, Stopped: stopped}
 	for _, s := range l.steps {
-		if s.kind == StepWriting || s.kind == StepRunning || (s.kind == StepThinking && s.think.len() == 0) {
+		// Live-only rows (a running command, a file being written, a thought
+		// in progress) are not history.
+		if s.kind == StepWriting || s.kind == StepRunning || s.kind == StepThinking {
 			continue
-		}
-		if stopped && s.kind == StepThinking {
-			s.hidden = false
 		}
 		msg.Steps = append(msg.Steps, s.toStep())
 	}
@@ -324,33 +334,39 @@ func (c *ChatModel) last() *liveStep {
 
 // closeThought marks an unfinished thought as finished: the model moved on.
 func (c *ChatModel) closeThought() {
-	if s := c.last(); s != nil && s.kind == StepThinking && !s.thinkDone {
-		s.thinkDone = true
-		s.touch()
+	if n := len(c.live.steps); n > 0 && c.live.steps[n-1].kind == StepThinking {
+		c.live.steps = c.live.steps[:n-1]
+		c.live.stepVer = nextVer()
 	}
 }
 
+// StreamThinking shows that the model is reasoning. The reasoning text itself
+// is not kept or drawn: only a "thinking…" heading appears, once, and nothing
+// is re-laid out for the tokens that follow, so a long thought costs nothing.
 func (c ChatModel) StreamThinking(s string) ChatModel {
 	if s == "" {
 		return c
 	}
-	st := c.last()
-	if st == nil || st.kind != StepThinking || st.thinkDone {
-		c.live.steps = append(c.live.steps, liveStep{kind: StepThinking})
-		st = c.last()
+	if st := c.last(); st != nil && st.kind == StepThinking {
+		return c
 	}
-	st.think.add(cleanText(s))
-	st.touch()
+	c.live.steps = append(c.live.steps, liveStep{kind: StepThinking})
 	c.live.stepVer = nextVer()
 	return c
 }
 
+// EndThinking finishes the thought in progress. A thought is only a live
+// "thinking…" heading: it is dropped as soon as it ends, so the timeline holds
+// nothing but real steps (files, commands) and the model's own text.
 func (c ChatModel) EndThinking(took time.Duration) ChatModel {
-	if s := c.last(); s != nil && s.kind == StepThinking && !s.thinkDone {
-		s.thinkDone = true
-		s.took = took
-		s.hidden = true
-		s.touch()
+	_ = took
+	return c.dropThought()
+}
+
+// dropThought removes a trailing thought from the live steps.
+func (c ChatModel) dropThought() ChatModel {
+	if n := len(c.live.steps); n > 0 && c.live.steps[n-1].kind == StepThinking {
+		c.live.steps = c.live.steps[:n-1]
 		c.live.stepVer = nextVer()
 	}
 	return c
@@ -457,12 +473,11 @@ func (s liveStep) toStep() Step {
 	case StepEdit:
 		return Step{Kind: StepEdit, Path: s.path, Diff: s.diff, Create: s.create, Output: s.fail,
 			Timeline: FileTimeline(s.path, s.create, s.diff, s.fail, s.hidden)}
+	case StepNote:
+		return Step{Kind: StepNote, Output: s.note}
 	}
-	tl := Timeline{Collapsed: s.hidden, Took: s.took}
-	if s.think.len() > 0 {
-		tl.Nodes = []TimelineNode{{Content: s.think.String()}}
-	}
-	return Step{Kind: StepThinking, Timeline: tl}
+	// A thought is never saved; this is only a safe fallback.
+	return Step{Kind: StepThinking}
 }
 
 // Tick advances the animation and commits a finished reply.
@@ -663,24 +678,33 @@ func (c ChatModel) renderMessage(i, cw int) []row {
 	case RoleAssistant:
 		first := true
 		for j, st := range m.Steps {
+			var rows []row
+			switch st.Kind {
+			case StepThinking:
+				continue // thoughts are not shown (an older version saved them)
+			case StepNote:
+				if strings.TrimSpace(st.Output) == "" {
+					continue
+				}
+				rows = plainRows(answerLines(st.Output, cw))
+			case StepReadFile:
+				rows = plainRows([]string{readFileLine(st.Path)})
+			case StepShell:
+				rows = plainRows(shellLines(st.Command, st.Output, cw))
+			case StepEdit:
+				tl := st.Timeline
+				if tl.Title == "" { // saved by an older version: rebuild it
+					tl = FileTimeline(st.Path, st.Create, st.Diff, st.Output, true)
+				}
+				rows = c.timelineRows(tl, cw, i*stepStride+j)
+			default:
+				continue
+			}
 			if !first {
 				out = append(out, row{head: headNone})
 			}
 			first = false
-			switch st.Kind {
-			case StepThinking:
-				out = append(out, c.timelineRows(st.Timeline, cw, i*stepStride+j)...)
-			case StepReadFile:
-				out = append(out, plainRows([]string{readFileLine(st.Path)})...)
-			case StepShell:
-				out = append(out, plainRows(shellLines(st.Command, st.Output, cw))...)
-			case StepEdit:
-				tl := st.Timeline
-				if tl.Title == "" { // saved by an older version: rebuild it
-					tl = FileTimeline(st.Path, st.Create, st.Diff, st.Output, tl.Collapsed)
-				}
-				out = append(out, c.timelineRows(tl, cw, i*stepStride+j)...)
-			}
+			out = append(out, rows...)
 		}
 		if m.Text != "" {
 			if !first {
@@ -735,11 +759,11 @@ func (c ChatModel) liveStepRows(s *liveStep, j, cw int) []row {
 	var rows []row
 	switch s.kind {
 	case StepThinking:
-		tl := Timeline{Running: !s.thinkDone, Collapsed: s.hidden, Took: s.took}
-		if s.think.len() > 0 {
-			tl.Nodes = []TimelineNode{{Content: s.think.String()}}
-		}
-		rows = c.timelineRows(tl, cw, -(2 + j))
+		// Only a live "thinking…" heading while the model reasons. It has no
+		// content to open and is dropped when the thought ends.
+		rows = c.timelineRows(Timeline{Running: true, Collapsed: true}, cw, headNone)
+	case StepNote:
+		rows = plainRows(answerLines(s.note, cw))
 	case StepReadFile:
 		rows = plainRows([]string{readFileLine(s.path)})
 	case StepShell:

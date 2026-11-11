@@ -22,55 +22,6 @@
       /* the extension was reloaded; this page needs a refresh */
     }
   }
-  const log = (level, msg) => relay({ type: 'log', src: 'page', level, msg });
-
-  // ---- trusted input --------------------------------------------------------
-  // dispatchEvent() and el.click() produce events with isTrusted === false,
-  // which a page can tell apart from a real user. background.js can drive
-  // Chrome's own input pipeline through the debugger protocol; those events are
-  // trusted. If that is unavailable (DevTools is open, the permission was not
-  // granted, the tab is not inspectable), every helper falls back to the DOM
-  // path so Kai keeps working.
-  function trusted(op, data) {
-    return new Promise((resolve) => {
-      try {
-        chrome.runtime.sendMessage({ type: 'trusted', op, ...data }, (res) => {
-          if (chrome.runtime.lastError) {
-            resolve({ ok: false, error: chrome.runtime.lastError.message });
-          } else {
-            resolve(res || { ok: false, error: 'no answer from the extension' });
-          }
-        });
-      } catch (e) {
-        resolve({ ok: false, error: String((e && e.message) || e) });
-      }
-    });
-  }
-
-  async function typePrompt(input, text) {
-    input.focus();
-    try {
-      input.setSelectionRange(0, (input.value || '').length);
-    } catch (_) {}
-    const t = await trusted('insertText', { text });
-    if (t.ok) {
-      await sleep(150);
-      if ((input.value || '').length === text.length) {
-        log('info', `typed ${text.length} chars with trusted input`);
-        return;
-      }
-      log('warn', `trusted input left ${(input.value || '').length} chars, expected ${text.length}: using the DOM fallback`);
-    } else {
-      log('warn', `trusted input unavailable (${t.error}): using the DOM fallback`);
-    }
-    setText(input, text);
-    await sleep(250);
-    if ((input.value || '').length !== text.length) {
-      log('warn', `textarea holds ${(input.value || '').length} chars, expected ${text.length}: typing again`);
-      setText(input, text);
-      await sleep(250);
-    }
-  }
 
   // ---- what the page-world hook tells us ------------------------------------
   window.addEventListener('message', (e) => {
@@ -99,9 +50,6 @@
       case 'error':
         relay({ type: 'sse_error', id: m.id, message: m.message });
         break;
-      case 'log':
-        relay({ type: 'log', src: 'inject', level: m.level, msg: m.msg });
-        break;
       case 'probe_ack':
         if (probeWaiter) {
           probeWaiter(m);
@@ -123,7 +71,6 @@
     }
     if (msg.type !== 'send') return;
     doSend(msg).then(sendResponse, (err) => {
-      log('error', `send crashed: ${(err && err.stack) || err}`);
       sendResponse({ ok: false, error: String((err && err.message) || err) });
     });
     return true; // answer asynchronously
@@ -151,30 +98,23 @@
   }
 
   async function doSend({ id, prompt }) {
-    log('info', `send ${id}: page ${location.pathname}, prompt ${prompt.length} chars`);
-
     if (onLoginPage()) {
       return { ok: false, error: `${HOST} is showing the login page: log in, then try again` };
     }
 
     let input = await waitFor(findInput, 30000);
     if (!input) {
-      log('error', `no chat input on ${location.pathname} (title: ${document.title})`);
       return { ok: false, error: `the chat input box was not found (is ${NAME} logged in and fully loaded?)` };
     }
 
     window.postMessage({ kai: true, from: 'content', type: 'arm', id }, '*');
     await typePrompt(input, prompt);
 
-    // Qwen is much more reliable with its send button than with Enter: the
-    // button stays disabled while a reply is still being written, while Enter
-    // silently does nothing in that state. Click first, retry with a fresh
-    // element if the page replaced the box or dropped the text.
+    // Qwen is much more reliable with its send button than with Enter
     if (QWEN) {
       if (await sendQwen(id, input, prompt)) return { ok: true };
       window.postMessage({ kai: true, from: 'content', type: 'disarm' }, '*');
-      log('error', `Qwen never sent the message (textarea chars: ${(input.value || '').length})`);
-      return { ok: false, error: 'the page did not send the message (see logs.txt for what the page did)' };
+      return { ok: false, error: 'the page did not send the message' };
     }
 
     const started = waitForStart(id, 12000);
@@ -184,21 +124,17 @@
 
     // Enter did not start a request within 12s.
     const left = (input.value || '').length;
-    log('warn', `Enter did not send within 12s (textarea still has ${left} chars)`);
     if (left > 0) {
       const retry = waitForStart(id, 15000);
-      const clicked = await clickSend(input);
-      log('info', clicked ? 'clicked the send button' : 'no usable send button found');
+      await clickSend(input);
       if (await retry) return { ok: true };
     } else {
       // The page took the text, so the request is probably still being prepared
-      // (DeepSeek's proof-of-work). Give it more time.
       if (await waitForStart(id, 25000)) return { ok: true };
     }
 
     window.postMessage({ kai: true, from: 'content', type: 'disarm' }, '*');
-    log('error', `the page never sent the message (textarea chars: ${(input.value || '').length})`);
-    return { ok: false, error: 'the page did not send the message (see logs.txt for what the page did)' };
+    return { ok: false, error: 'the page did not send the message' };
   }
 
   // sendQwen waits for the page to go idle, makes sure the box holds the
@@ -213,15 +149,12 @@
       const started = waitForStart(id, 12000);
       const clicked = await clickSend(input);
       if (!clicked) {
-        log('warn', 'Qwen has no enabled send button: pressing Enter');
         await pressEnter(input);
       }
       if (await started) {
-        log('info', `Qwen started the request (attempt ${attempt + 1})`);
         return true;
       }
 
-      log('warn', `Qwen did not start the request (attempt ${attempt + 1}/3, box has ${(input.value || '').length} of ${prompt.length} chars)`);
       await waitIdle(5000);
       const fresh = (await waitFor(findInput, 8000)) || input;
       input = fresh;
@@ -266,14 +199,11 @@
       input = box;
       const have = (input.value || '').length;
       if (btn && have === prompt.length) {
-        if (attempt > 0) log('info', 'the send button is ready');
         return input;
       }
-      log('warn', `Qwen is not ready to send (button ${btn ? 'enabled' : 'disabled'}, box has ${have} of ${prompt.length} chars): typing again`);
       await typePrompt(input, prompt);
       waitMs = 8000;
     }
-    log('warn', 'Qwen never showed an enabled send button: trying Enter anyway');
     return input;
   }
 
@@ -294,7 +224,7 @@
     while (Date.now() < end) {
       const v = fn();
       if (v) return v;
-      await sleep(250);
+      await sleep(60);
     }
     return null;
   }
@@ -321,10 +251,17 @@
     el.dispatchEvent(new Event('change', { bubbles: true }));
   }
 
+  // Puts the prompt into the box in one step. React sometimes drops the first
+  // update right after the page re-renders, so it is checked once.
+  async function typePrompt(input, prompt) {
+    setText(input, prompt);
+    if ((input.value || '') !== prompt) {
+      await sleep(40);
+      setText(input, prompt);
+    }
+  }
+
   async function pressEnter(input) {
-    const t = await trusted('key', { key: 'Enter' });
-    if (t.ok) return;
-    log('warn', `trusted Enter unavailable (${t.error}): using DOM events`);
     syntheticEnter(input);
   }
 
@@ -364,14 +301,7 @@
     const send = findSendButton(input);
     if (!send) return false;
     send.scrollIntoView({ block: 'center', inline: 'center' });
-    await sleep(100);
-    const r = send.getBoundingClientRect();
-    const t = await trusted('click', { x: r.left + r.width / 2, y: r.top + r.height / 2 });
-    if (t.ok) {
-      log('info', 'clicked the send button with trusted input');
-      return true;
-    }
-    log('warn', `trusted click unavailable (${t.error}): using the DOM fallback`);
+    await sleep(50);
     send.click();
     return true;
   }

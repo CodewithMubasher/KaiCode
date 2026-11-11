@@ -15,28 +15,6 @@ $('selftest').addEventListener('click', async () => {
   $('test').textContent = r.lines.join('\n');
 });
 
-async function logs() {
-  return (await chrome.runtime.sendMessage({ type: 'get_logs' })).text;
-}
-
-$('download').addEventListener('click', async () => {
-  const blob = new Blob([await logs()], { type: 'text/plain' });
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = 'logs.txt';
-  a.click();
-});
-
-$('copy').addEventListener('click', async () => {
-  await navigator.clipboard.writeText(await logs());
-  $('test').textContent = 'Logs copied.';
-});
-
-$('clear').addEventListener('click', async () => {
-  await chrome.runtime.sendMessage({ type: 'clear_logs' });
-  $('test').textContent = 'Logs cleared.';
-});
-
 async function refresh() {
   const el = $('state');
   try {

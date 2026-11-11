@@ -152,36 +152,46 @@ func (a *Agent) loopNative(ctx context.Context, user string, emit func(Event) bo
 			return
 		}
 
-		for _, tc := range calls {
-			call, perr := toToolCall(tc)
-			c := a.cfg.Tools.Normalize(call)
-			if !emit(Event{Kind: EvToolCall, Call: &c}) {
+		// Announce every call first so the timeline shows the whole batch,
+		// then run the batch in parallel. Results come back in call order.
+		norm := make([]tools.Call, len(calls))
+		perrs := make([]error, len(calls))
+		for i, tc := range calls {
+			var call tools.Call
+			call, perrs[i] = toToolCall(tc)
+			norm[i] = a.cfg.Tools.Normalize(call)
+			if !emit(Event{Kind: EvToolCall, Call: &norm[i]}) {
 				return
 			}
-			var r tools.Result
-			if perr != nil {
-				// Not run: the model reads why and sends the call again.
-				out := perr.Error()
-				if h := a.cfg.Tools.Help(c.Name); h != "" {
-					out += "\n" + h
+		}
+		stopped := false
+		ok := runBatch(ctx, norm,
+			func(i int, c tools.Call) tools.Result {
+				if perrs[i] != nil {
+					out := perrs[i].Error()
+					if h := a.cfg.Tools.Help(c.Name); h != "" {
+						out += "\n" + h
+					}
+					return tools.Result{ID: c.ID, Name: c.Name, IsError: true, Output: out, Short: perrs[i].Error()}
 				}
-				r = tools.Result{ID: c.ID, Name: c.Name, IsError: true, Output: out, Short: perr.Error()}
-			} else {
-				r = a.cfg.Tools.Execute(ctx, c, a.cfg.ToolTimeout)
-			}
-			if ctx.Err() != nil {
-				return
-			}
-			stop := guard.note(a.cfg.Tools, c, &r)
-			if !emit(Event{Kind: EvToolResult, Call: &c, Result: &r}) {
-				return
-			}
-			a.record("tool", r.Output, "")
-			a.appendMsg(toolMessage(tc.ID, r))
-			if stop {
-				emit(Event{Kind: EvError, Err: repeatError(c.Name)})
-				return
-			}
+				return a.cfg.Tools.Execute(ctx, c, a.cfg.ToolTimeout)
+			},
+			func(i int, r tools.Result) bool {
+				stop := guard.note(a.cfg.Tools, norm[i], &r)
+				if !emit(Event{Kind: EvToolResult, Call: &norm[i], Result: &r}) {
+					return false
+				}
+				a.record("tool", r.Output, "")
+				a.appendMsg(toolMessage(calls[i].ID, r))
+				if stop {
+					stopped = true
+					emit(Event{Kind: EvError, Err: repeatError(norm[i].Name)})
+					return false
+				}
+				return true
+			})
+		if !ok || stopped {
+			return
 		}
 	}
 	emit(Event{Kind: EvError, Err: fmt.Errorf("stopped after %d steps without a final answer", a.cfg.MaxSteps)})

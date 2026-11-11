@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"kai/internal/tools"
 )
@@ -92,28 +93,46 @@ func (a *Agent) loopWeb(ctx context.Context, user string, emit func(Event) bool)
 			continue
 		}
 
-		results := make([]tools.Result, 0, len(res.calls))
+		// Announce every call first so the timeline shows the whole batch,
+		// then run the batch in parallel. Results come back in call order.
+		calls := make([]tools.Call, len(res.calls))
 		for i := range res.calls {
-			c := a.cfg.Tools.Normalize(res.calls[i])
-			if !emit(Event{Kind: EvToolCall, Call: &c}) {
-				return
-			}
-			r := a.cfg.Tools.Execute(ctx, c, a.cfg.ToolTimeout)
-			if ctx.Err() != nil {
-				return
-			}
-			stop := guard.note(a.cfg.Tools, c, &r)
-			if !emit(Event{Kind: EvToolResult, Call: &c, Result: &r}) {
-				return
-			}
-			a.record("tool", r.Output, "")
-			results = append(results, r)
-			if stop {
-				emit(Event{Kind: EvError, Err: repeatError(c.Name)})
+			calls[i] = a.cfg.Tools.Normalize(res.calls[i])
+			if !emit(Event{Kind: EvToolCall, Call: &calls[i]}) {
 				return
 			}
 		}
+		results := make([]tools.Result, 0, len(calls))
+		stopped := false
+		began := time.Now()
+		ok := runBatch(ctx, calls,
+			func(_ int, c tools.Call) tools.Result {
+				return a.cfg.Tools.Execute(ctx, c, a.cfg.ToolTimeout)
+			},
+			func(i int, r tools.Result) bool {
+				stop := guard.note(a.cfg.Tools, calls[i], &r)
+				if !emit(Event{Kind: EvToolResult, Call: &calls[i], Result: &r}) {
+					return false
+				}
+				a.record("tool", r.Output, "")
+				results = append(results, r)
+				if stop {
+					stopped = true
+					emit(Event{Kind: EvError, Err: repeatError(calls[i].Name)})
+					return false
+				}
+				return true
+			})
+		if !ok || stopped {
+			return
+		}
+		slog.Debug("tool batch done", "calls", len(calls), "took", since(began))
 		body = encodeResults(proto, a.cfg.Tools.Specs(), results)
+		if res.partial != "" {
+			// Some calls were readable and ran; say plainly that the rest did not.
+			body = "Note: part of your last reply could not be read and was NOT run (" + res.partial +
+				"). If it mattered, send that call again.\n\n" + body
+		}
 	}
 	emit(Event{Kind: EvError, Err: fmt.Errorf("stopped after %d steps without a final answer", a.cfg.MaxSteps)})
 }
@@ -122,6 +141,7 @@ type turnResult struct {
 	text    string       // visible text of the reply
 	calls   []tools.Call // tool calls found in it
 	problem string       // why the reply's tool call could not be read ("" if fine)
+	partial string       // calls were found, but some part of the reply could not be read
 }
 
 // turn sends one prompt and reads the whole reply, forwarding text and
@@ -250,8 +270,12 @@ read:
 
 	res.text = text.String()
 	res.calls = p.Calls()
-	if len(res.calls) == 0 && len(p.Warnings()) > 0 {
-		res.problem = strings.Join(p.Warnings(), "; ")
+	if w := p.Warnings(); len(w) > 0 {
+		if len(res.calls) == 0 {
+			res.problem = strings.Join(w, "; ")
+		} else {
+			res.partial = strings.Join(w, "; ")
+		}
 	}
 	return res, nil
 }

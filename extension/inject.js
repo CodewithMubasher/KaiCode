@@ -13,8 +13,6 @@
   const alive = () => window.__kaiActive === token;
 
   const post = (m) => window.postMessage({ kai: true, from: 'inject', ...m }, '*');
-  const log = (level, msg) => post({ type: 'log', level, msg });
-
   let armedId = null; // the Kai request waiting for its completion call
   let armTimer = null;
   let seenCompletions = 0;
@@ -38,10 +36,8 @@
       armTimer = setTimeout(() => {
         if (armedId === m.id) {
           armedId = null;
-          log('warn', `armed ${m.id} expired after 180s: the page never made a completion request`);
         }
       }, 180000);
-      log('info', `armed for ${m.id}`);
     } else if (m.type === 'disarm') {
       armedId = null;
       clearTimeout(armTimer);
@@ -71,17 +67,12 @@
       armedId = null;
       clearTimeout(armTimer);
       post({ type: 'sent', id: armed });
-      log('info', `completion request started: ${method} ${path}`);
       // Qwen names the chat in the request address (?chat_id=...). It is known
       // before the page moves to the chat's own URL, so Kai can find the chat again.
       try {
         const cid = new URL(url, location.href).searchParams.get('chat_id');
         if (cid) post({ type: 'chat_id', id: armed, chatId: cid });
       } catch (_) {}
-    } else if (armed && path.startsWith('/api/')) {
-      log('info', `while armed, the page called ${method} ${path}`);
-    } else if (!armed && completion) {
-      log('info', `the page made a completion request by itself (not Kai): ${path}`);
     }
 
     const p = original.apply(this, arguments);
@@ -90,30 +81,31 @@
     return p.then(
       (res) => {
         try {
-          const ct = (res.headers && res.headers.get('content-type')) || '';
-          if (path.startsWith('/api/')) log('info', `${method} ${path} -> HTTP ${res.status} ${ct}`);
-          let id = armed && completion ? armed : null;
-          if (!id && armedId === armed && ct.includes('text/event-stream')) {
+          let id = completion ? armed : null;
+          if (!id && armedId === armed) {
             // The completion endpoint was renamed: take the event stream anyway.
-            id = armed;
-            armedId = null;
-            post({ type: 'sent', id });
-            log('warn', `captured an event stream from an unexpected path: ${path}`);
+            const ct = String((res.headers && res.headers.get('content-type')) || '');
+            if (ct.includes('text/event-stream')) {
+              id = armed;
+              armedId = null;
+              clearTimeout(armTimer);
+              post({ type: 'sent', id });
+            }
           }
           if (id) {
             if (!res.ok || !res.body) {
-              post({ type: 'error', id, message: `${SITE_NAME} answered HTTP ${res.status} for ${path}` });
+              post({ type: 'error', id, message: `${SITE_NAME} answered HTTP ${res.status}` });
             } else {
               relay(id, res.clone());
             }
           }
-        } catch (err) {
-          log('error', `fetch hook failed: ${err}`);
+        } catch (_) {
+          // the page must never see a failure caused by the hook
         }
         return res;
       },
       (err) => {
-        if (armed && completion) post({ type: 'error', id: armed, message: `the completion request failed: ${err}` });
+        if (armed && completion) post({ type: 'error', id: armed, message: `Request failed: ${err}` });
         throw err;
       }
     );
@@ -124,23 +116,20 @@
   async function relay(id, res) {
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
-    let total = 0;
     try {
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
         const data = decoder.decode(value, { stream: true });
         if (data) {
-          total += data.length;
           post({ type: 'chunk', id, data });
         }
       }
       const tail = decoder.decode();
       if (tail) post({ type: 'chunk', id, data: tail });
-      log('info', `reply stream ended after ${total} chars`);
       post({ type: 'end', id });
     } catch (err) {
-      post({ type: 'error', id, message: `reading the reply failed: ${err}` });
+      post({ type: 'error', id, message: `Reading reply failed` });
     }
   }
 
@@ -160,7 +149,6 @@
         armedId = null;
         clearTimeout(armTimer);
         post({ type: 'sent', id });
-        log('warn', `completion went through XMLHttpRequest: ${k.path}`);
         let offset = 0;
         const pump = () => {
           try {
@@ -181,8 +169,8 @@
       return send.apply(this, arguments);
     };
   } catch (err) {
-    log('warn', `could not hook XMLHttpRequest: ${err}`);
+    // Silent fail for XHR hook
   }
 
-  log('info', `hook v${VERSION} installed on ${location.pathname}`);
+  // Hook installed silently
 })();
