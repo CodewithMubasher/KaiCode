@@ -53,8 +53,53 @@ func TestFailedEditLeavesNoProgressLine(t *testing.T) {
 	if strings.Contains(v, "editing file") {
 		t.Errorf("progress line left behind after a failed edit:\n%s", v)
 	}
-	if n := strings.Count(v, "Error: not found"); n != 1 {
-		t.Errorf("the error appears %d times:\n%s", n, v)
+	if !strings.Contains(v, "Could not edit x.go") || strings.Count(v, "not found") != 1 {
+		t.Errorf("expected one failure node with a one-line reason:\n%s", v)
+	}
+	if strings.Contains(v, "Error:") {
+		t.Errorf("a raw tool result must not be drawn:\n%s", v)
+	}
+}
+
+func TestCreateFileShowsFullContentAsNode(t *testing.T) {
+	m := testModel()
+	args := map[string]any{"path": "a/b.go", "content": "package b\n\nfunc B() {}\n"}
+	m = m.applyEvent(harness.Event{Kind: harness.EvToolCall, Call: call("create_file", args)})
+	m = m.applyEvent(harness.Event{Kind: harness.EvToolResult, Call: call("create_file", args), Result: &tools.Result{Output: `successfully created file "a/b.go"`}})
+	v := view(m)
+	if !strings.Contains(v, "Created a/b.go") {
+		t.Errorf("missing the heading:\n%s", v)
+	}
+	// Once the tool call is done the node is collapsed: heading only.
+	if strings.Contains(v, "package b") {
+		t.Errorf("a finished create_file node should be collapsed:\n%s", v)
+	}
+	if strings.Contains(v, "successfully created") || strings.Contains(v, "create_file") {
+		t.Errorf("tool result or raw call leaked into the chat:\n%s", v)
+	}
+}
+
+func TestEditShowsDiffNode(t *testing.T) {
+	m := testModel()
+	args := map[string]any{"path": "x.go", "old_string": "a := 1", "new_string": "a := 2"}
+	m = m.applyEvent(harness.Event{Kind: harness.EvToolCall, Call: call("edit_file", args)})
+	m = m.applyEvent(harness.Event{Kind: harness.EvToolResult, Call: call("edit_file", args), Result: &tools.Result{Output: "Edited x.go: 1 replacement(s), first at line 7.\n- a := 1\n+ a := 2"}})
+	v := view(m)
+	for _, want := range []string{"Edited x.go", "- a := 1", "+ a := 2", "7"} {
+		if !strings.Contains(v, want) {
+			t.Errorf("missing %q:\n%s", want, v)
+		}
+	}
+}
+
+func TestMissingParameterShowsOneLine(t *testing.T) {
+	m := testModel()
+	m = m.applyEvent(harness.Event{Kind: harness.EvToolCall, Call: call("shell", map[string]any{})})
+	m = m.applyEvent(harness.Event{Kind: harness.EvToolResult, Call: call("shell", map[string]any{}),
+		Result: &tools.Result{IsError: true, Output: "long guidance for the model\nCorrect usage: shell(...)", Short: `missing required parameter "command" for tool "shell"`}})
+	v := view(m)
+	if !strings.Contains(v, "missing required parameter") || strings.Contains(v, "Correct usage") {
+		t.Errorf("the person should see only the short reason:\n%s", v)
 	}
 }
 

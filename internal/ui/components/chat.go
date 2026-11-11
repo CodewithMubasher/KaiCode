@@ -102,6 +102,7 @@ type liveStep struct {
 	cmd  string
 	out  string
 	diff []DiffLine
+	fail string // StepEdit: why the edit failed ("" when it worked)
 
 	name   string
 	create bool
@@ -380,10 +381,24 @@ func (c ChatModel) RunShell(cmd, output string) ChatModel {
 	return c
 }
 
+// EditFile adds a finished file step to the timeline: the full content of a
+// created file, or the diff of an edit. A created file starts collapsed (its
+// heading only) once the tool call is done, so a long file does not push the
+// conversation off screen; clicking the heading opens it. An edit's diff is
+// short and stays open.
 func (c ChatModel) EditFile(path string, create bool, diff []DiffLine) ChatModel {
 	c.closeThought()
 	c = c.dropTransient()
-	c.live.steps = append(c.live.steps, liveStep{kind: StepEdit, path: path, diff: diff, create: create})
+	c.live.steps = append(c.live.steps, liveStep{kind: StepEdit, path: path, diff: diff, create: create, hidden: create})
+	c.live.stepVer = nextVer()
+	return c
+}
+
+// EditFailed adds a file step that did not work, with a one-line reason.
+func (c ChatModel) EditFailed(path string, create bool, reason string) ChatModel {
+	c.closeThought()
+	c = c.dropTransient()
+	c.live.steps = append(c.live.steps, liveStep{kind: StepEdit, path: path, create: create, fail: oneLine(reason, 200)})
 	c.live.stepVer = nextVer()
 	return c
 }
@@ -441,7 +456,8 @@ func (s liveStep) toStep() Step {
 	case StepShell:
 		return Step{Kind: StepShell, Command: s.cmd, Output: s.out}
 	case StepEdit:
-		return Step{Kind: StepEdit, Path: s.path, Diff: s.diff, Create: s.create}
+		return Step{Kind: StepEdit, Path: s.path, Diff: s.diff, Create: s.create, Output: s.fail,
+			Timeline: FileTimeline(s.path, s.create, s.diff, s.fail, s.hidden)}
 	}
 	tl := Timeline{Collapsed: s.hidden, Took: s.took}
 	if s.think.len() > 0 {
@@ -648,10 +664,6 @@ func (c ChatModel) renderMessage(i, cw int) []row {
 	case RoleAssistant:
 		first := true
 		for j, st := range m.Steps {
-			// Diffs are not drawn in the chat; file blocks arrive as shell steps.
-			if st.Kind == StepEdit {
-				continue
-			}
 			if !first {
 				out = append(out, row{head: headNone})
 			}
@@ -663,6 +675,12 @@ func (c ChatModel) renderMessage(i, cw int) []row {
 				out = append(out, plainRows([]string{readFileLine(st.Path)})...)
 			case StepShell:
 				out = append(out, plainRows(shellLines(st.Command, st.Output, cw))...)
+			case StepEdit:
+				tl := st.Timeline
+				if tl.Title == "" { // saved by an older version: rebuild it
+					tl = FileTimeline(st.Path, st.Create, st.Diff, st.Output, tl.Collapsed)
+				}
+				out = append(out, c.timelineRows(tl, cw, i*stepStride+j)...)
 			}
 		}
 		if m.Text != "" {
@@ -727,6 +745,8 @@ func (c ChatModel) liveStepRows(s *liveStep, j, cw int) []row {
 		rows = plainRows([]string{readFileLine(s.path)})
 	case StepShell:
 		rows = plainRows(shellLines(s.cmd, s.out, cw))
+	case StepEdit:
+		rows = c.timelineRows(FileTimeline(s.path, s.create, s.diff, s.fail, s.hidden), cw, -(2 + j))
 	case StepWriting:
 		path, create, lines := s.path, s.create, s.lines
 		rows = []row{{head: headNone, text: writeLine("✎", path, create, lines)}}
