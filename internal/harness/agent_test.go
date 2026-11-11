@@ -118,7 +118,7 @@ func TestToolLoop(t *testing.T) {
 	if !strings.Contains(prompts[0], "sys") || !strings.Contains(prompts[0], "do it") || !strings.Contains(prompts[0], `"name":"echo"`) {
 		t.Errorf("first prompt = %q", prompts[0])
 	}
-	if prompts[1] != "<tool_result>\necho:hi\n</tool_result>" {
+	if !strings.HasPrefix(prompts[1], "<tool_result name=\"echo\">\necho:hi\n</tool_result>") || !strings.Contains(prompts[1], "Continue the task") {
 		t.Errorf("second prompt = %q", prompts[1])
 	}
 	// The reply id from turn one becomes the parent of turn two.
@@ -318,7 +318,7 @@ func TestLostChatIsRestartedWithARecap(t *testing.T) {
 		t.Fatalf("provider calls = %d, want 3", f.calls)
 	}
 	retry := f.prompts[2]
-	for _, want := range []string{"<kai_instructions>", "Recap", "User: do it", "Assistant: Checking.", "<tool_result>\necho:hi"} {
+	for _, want := range []string{"<kai_instructions>", "Recap", "User: do it", "Assistant: Checking.", "<tool_result name=\"echo\">\necho:hi"} {
 		if !strings.Contains(retry, want) {
 			t.Errorf("retry prompt is missing %q:\n%s", want, retry)
 		}

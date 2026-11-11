@@ -24,6 +24,8 @@ Rules:
 - Copy the tags exactly as shown: ASCII "|" bars, one on each side of DSML, and the wrapper name tool_calls.
 - Only use the tools and parameters defined below.
 - When the task is finished, reply normally without a tool_calls block.
+- A result that starts with "Error:" means the call FAILED. Read the message (it shows the correct usage), fix the call, and never send the same call again unchanged.
+- Every required parameter must be present in every call, spelled exactly as defined below.
 
 ### Available tools
 `
@@ -37,6 +39,34 @@ func ToolsPrompt(specs []tools.Spec) string {
 		b.WriteString(s.JSON())
 		b.WriteString("\n")
 	}
+	b.WriteString("\n### Example calls (one per tool, with the required parameters)\n\n")
+	for _, s := range specs {
+		b.WriteString(exampleCall(s))
+		b.WriteString("\n\n")
+	}
+	return b.String()
+}
+
+// exampleCall shows one valid call of the tool in DSML, using the parameters'
+// example values, so the model sees the exact parameter names it must use.
+func exampleCall(s tools.Spec) string {
+	var b strings.Builder
+	b.WriteString("<|DSML|tool_calls>\n<|DSML|invoke name=\"" + s.Name + "\">\n")
+	for _, p := range s.Params {
+		if !p.Required {
+			continue
+		}
+		ex := p.Example
+		if ex == "" {
+			ex = "<" + p.Name + ">"
+		}
+		str := "true"
+		if p.Type == "integer" || p.Type == "number" || p.Type == "boolean" {
+			str = "false"
+		}
+		b.WriteString("<|DSML|parameter name=\"" + p.Name + "\" string=\"" + str + "\">" + ex + "</|DSML|parameter>\n")
+	}
+	b.WriteString("</|DSML|invoke>\n</|DSML|tool_calls>")
 	return b.String()
 }
 
@@ -57,17 +87,34 @@ func FirstPrompt(system string, specs []tools.Spec, user string) string {
 }
 
 // EncodeResults is the next message after tool calls: one <tool_result> per
-// call, in call order.
+// call, in call order, each named after its tool, followed by a short note on
+// what to do next. A web chat sees this as an ordinary user message, so the
+// note says what it is and that the task goes on: without it a model may
+// answer the text instead of carrying on, or repeat a call that already worked.
 func EncodeResults(rs []tools.Result) string {
 	parts := make([]string, 0, len(rs))
+	failed := false
 	for _, r := range rs {
 		out := r.Output
+		attr := ""
+		if r.Name != "" {
+			attr = ` name="` + r.Name + `"`
+		}
 		if r.IsError {
 			out = "Error: " + out
+			attr += ` status="error"`
+			failed = true
 		}
-		parts = append(parts, "<tool_result>\n"+out+"\n</tool_result>")
+		parts = append(parts, "<tool_result"+attr+">\n"+out+"\n</tool_result>")
 	}
-	return strings.Join(parts, "\n")
+	note := "The results above come from your tool calls, run on the user's machine. " +
+		"Continue the task: if you need more, send another tool call in the DSML format; " +
+		"if the task is finished, answer the user in plain text with no tool call. " +
+		"Do not repeat a call that already succeeded."
+	if failed {
+		note = `A call FAILED (status="error"). Read its error, fix the call, and do not send it again unchanged. ` + note
+	}
+	return strings.Join(parts, "\n") + "\n\n" + note
 }
 
 // RepairPrompt asks the model to resend a tool call that could not be read.

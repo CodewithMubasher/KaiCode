@@ -72,7 +72,7 @@ func (m *MockProvider) Send(ctx context.Context, t Turn) (<-chan StreamEvent, er
 // DemoScript is a tiny scripted "model": it reads go.mod, then summarises it.
 // It lets the UI run the real loop before the Chrome bridge exists.
 func DemoScript(turn int, t Turn) string {
-	if strings.HasPrefix(t.Prompt, "<tool_result>") {
+	if strings.HasPrefix(t.Prompt, "<tool_result") {
 		return "Done. The project is a Go module named `kai`, built on Bubble Tea.\n\n" +
 			"This reply came from the demo provider, so it is scripted: the loop, the DSML parsing and the " +
 			"tool call you just saw were all real."

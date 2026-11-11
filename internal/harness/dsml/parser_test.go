@@ -151,9 +151,18 @@ func TestEncodeResults(t *testing.T) {
 		{Name: "a", Output: "one"},
 		{Name: "b", Output: "bad", IsError: true},
 	})
-	want := "<tool_result>\none\n</tool_result>\n<tool_result>\nError: bad\n</tool_result>"
-	if got != want {
-		t.Errorf("got %q", got)
+	for _, want := range []string{
+		"<tool_result name=\"a\">\none\n</tool_result>",
+		"<tool_result name=\"b\" status=\"error\">\nError: bad\n</tool_result>",
+		"A call FAILED",
+		"Continue the task",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in %q", want, got)
+		}
+	}
+	if ok := EncodeResults([]tools.Result{{Name: "a", Output: "one"}}); strings.Contains(ok, "FAILED") {
+		t.Errorf("a successful result must not mention a failure: %q", ok)
 	}
 }
 
