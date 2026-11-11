@@ -1,11 +1,32 @@
-// Service worker: long-polls Kai for commands, drives the DeepSeek tab, and
+// Service worker: long-polls Kai for commands, drives the DeepSeek or Qwen tab, and
 // forwards the page's raw SSE back to Kai. No setup: the address is fixed and
 // there is no token.
 
 const DEFAULT_ADDR = 'http://127.0.0.1:8765';
-const FRESH_CHAT = 'https://chat.deepseek.com/';
-const DEEPSEEK = 'https://chat.deepseek.com/*';
 const HEADERS = { 'X-Kai-Client': 'kai-bridge' };
+
+// The web chats Kai can drive. Kai says which one in every command.
+const SITES = {
+  deepseek: {
+    name: 'DeepSeek',
+    host: 'chat.deepseek.com',
+    fresh: 'https://chat.deepseek.com/',
+    match: 'https://chat.deepseek.com/*',
+    isChatPath: (p) => p !== '/' && p !== '' && !/sign_in|sign_up|login|register/.test(p),
+  },
+  qwen: {
+    name: 'Qwen',
+    host: 'chat.qwen.ai',
+    fresh: 'https://chat.qwen.ai/',
+    match: 'https://chat.qwen.ai/*',
+    // A Qwen chat lives at /c/<id>; the home page and settings pages are not chats.
+    isChatPath: (p) => /^\/c\/[^/]+/.test(p),
+    // The completion request names the chat, which is known before the page
+    // moves to the chat's own address.
+    chatUrl: (id) => `https://chat.qwen.ai/c/${id}`,
+  },
+};
+const siteOf = (name) => SITES[name] || SITES.deepseek;
 
 let connected = false;
 let lastError = '';
@@ -87,10 +108,10 @@ function setState(ok, error) {
 }
 
 // ---- the chat Kai owns ---------------------------------------------------------
-// One Kai session = one DeepSeek chat. We remember which, so every message of
+// One Kai session = one web chat (DeepSeek or Qwen). We remember which, so every message of
 // the session lands in the same chat, and a new session opens a new one.
 
-let chat = { session: null, url: null, tabId: null };
+let chat = { session: null, url: null, tabId: null, site: 'deepseek' };
 const chatLoaded = chrome.storage.session
   .get('chat')
   .catch(() => ({}))
@@ -106,7 +127,7 @@ const pathOf = (url) => {
     return '';
   }
 };
-const isChatPath = (p) => p !== '/' && p !== '' && !/sign_in|sign_up|login|register/.test(p);
+const isChatPath = (p) => siteOf(chat.site).isChatPath(p);
 
 // The first time the Kai tab moves to a real chat URL, that is the chat.
 function noteUrl(tabId, url) {
@@ -119,6 +140,31 @@ function noteUrl(tabId, url) {
 chrome.tabs.onUpdated.addListener((tabId, info) => {
   if (info.url) noteUrl(tabId, info.url);
 });
+
+// The completion request of a site that names its chat (Qwen: ?chat_id=...)
+// tells us the chat's address right away, without waiting for the page to move.
+function noteChatId(tabId, chatId, host) {
+  if (!chat.session || tabId !== chat.tabId || !chatId) return;
+  const site = Object.values(SITES).find((s) => s.host === host);
+  if (!site || !site.chatUrl) return;
+  const url = site.chatUrl(chatId);
+  if (chat.url === url) return;
+  chat.url = url;
+  persistChat();
+  log('info', `this session's chat is ${url} (named by the completion request)`);
+}
+
+// Qwen moves the tab from "/" to "/c/<id>" a moment after a new chat's first
+// reply ends. A tool result sent in that gap used to be typed into the home page
+// and ended up in a new chat. Give the page a moment to arrive.
+async function settleOnChat(tab, url) {
+  for (let i = 0; i < 12 && pathOf(tab.url) === '/'; i++) {
+    await sleep(500);
+    tab = await chrome.tabs.get(tab.id);
+    if (pathOf(tab.url) === pathOf(url)) log('info', `the tab arrived at ${pathOf(url)}`);
+  }
+  return tab;
+}
 
 // ---- talking to Kai ------------------------------------------------------------
 
@@ -222,7 +268,7 @@ function handleCommand(cmd) {
 }
 
 async function runSend(cmd) {
-  log('info', `${cmd.id}: send received (session ${cmd.session}, newChat=${cmd.newChat}, ${(cmd.prompt || '').length} chars)`);
+  log('info', `${cmd.id}: send received (${siteOf(cmd.site).host}, session ${cmd.session}, newChat=${cmd.newChat}, ${(cmd.prompt || '').length} chars)`);
   post({ id: cmd.id, type: 'accepted' });
   try {
     const prep = await prepareTab(cmd);
@@ -233,12 +279,12 @@ async function runSend(cmd) {
     }
     let res;
     try {
-      res = await sendToTab(prep.tab.id, { type: 'send', id: cmd.id, prompt: cmd.prompt });
+      res = await sendToTab(prep.tab.id, { type: 'send', id: cmd.id, prompt: cmd.prompt }, siteOf(cmd.site));
     } finally {
       await detachDebugger(prep.tab.id);
     }
     if (!res || !res.ok) {
-      const message = (res && res.error) || 'the DeepSeek page did not respond';
+      const message = (res && res.error) || `the ${siteOf(cmd.site).name} page did not respond`;
       log('error', `${cmd.id}: could not send: ${message}`);
       await post({ id: cmd.id, type: 'error', message });
     } else {
@@ -250,21 +296,21 @@ async function runSend(cmd) {
   }
 }
 
-async function findTab() {
-  const tabs = await chrome.tabs.query({ url: DEEPSEEK });
+async function findTab(site) {
+  const tabs = await chrome.tabs.query({ url: site.match });
   return tabs.find((t) => t.id === chat.tabId) || tabs[0] || null;
 }
 
-async function openTab(url) {
+async function openTab(url, site) {
   log('info', `opening ${url} in a new tab`);
   const tab = await chrome.tabs.create({ url, active: false });
-  await waitLoaded(tab.id);
+  await waitLoaded(tab.id, site);
   return chrome.tabs.get(tab.id);
 }
 
-async function navigate(tabId, url) {
+async function navigate(tabId, url, site) {
   log('info', `tab ${tabId}: going to ${url}`);
-  const loaded = waitLoaded(tabId);
+  const loaded = waitLoaded(tabId, site);
   await chrome.tabs.update(tabId, { url });
   await loaded;
   return chrome.tabs.get(tabId);
@@ -273,12 +319,13 @@ async function navigate(tabId, url) {
 // Decide which tab and chat a send goes to.
 async function prepareTab(cmd) {
   await chatLoaded;
-  let tab = await findTab();
+  const site = siteOf(cmd.site);
+  let tab = await findTab(site);
 
   if (cmd.newChat) {
-    chat = { session: cmd.session, url: null, tabId: null };
-    if (!tab) tab = await openTab(FRESH_CHAT);
-    else if (pathOf(tab.url) !== '/') tab = await navigate(tab.id, FRESH_CHAT);
+    chat = { session: cmd.session, url: null, tabId: null, site: cmd.site || 'deepseek' };
+    if (!tab) tab = await openTab(site.fresh, site);
+    else if (pathOf(tab.url) !== '/') tab = await navigate(tab.id, site.fresh, site);
     chat.tabId = tab.id;
     persistChat();
     return { tab };
@@ -287,12 +334,18 @@ async function prepareTab(cmd) {
   if (!chat.session || chat.session !== cmd.session) {
     return { lost: `this extension does not know session ${cmd.session} (it has ${chat.session})` };
   }
+  if ((chat.site || 'deepseek') !== (cmd.site || 'deepseek')) {
+    return { lost: `this session's chat is on ${siteOf(chat.site).host}, not ${site.host}` };
+  }
   if (!tab) {
-    if (!chat.url) return { lost: 'the DeepSeek tab was closed before the chat got an address' };
-    tab = await openTab(chat.url);
+    if (!chat.url) return { lost: `the ${site.name} tab was closed before the chat got an address` };
+    tab = await openTab(chat.url, site);
   } else if (chat.url && pathOf(tab.url) !== pathOf(chat.url)) {
+    if (site.chatUrl) tab = await settleOnChat(tab, chat.url);
+  }
+  if (tab && chat.url && pathOf(tab.url) !== pathOf(chat.url)) {
     log('info', `the tab left Kai's chat (${pathOf(tab.url)}): going back`);
-    tab = await navigate(tab.id, chat.url);
+    tab = await navigate(tab.id, chat.url, site);
   } else if (!chat.url && isChatPath(pathOf(tab.url))) {
     chat.url = tab.url;
   }
@@ -301,11 +354,11 @@ async function prepareTab(cmd) {
   return { tab };
 }
 
-function waitLoaded(tabId, timeout = 25000) {
+function waitLoaded(tabId, site, timeout = 25000) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       chrome.tabs.onUpdated.removeListener(listener);
-      reject(new Error('the DeepSeek page took too long to load'));
+      reject(new Error(`the ${site.name} page took too long to load`));
     }, timeout);
     function listener(id, info) {
       if (id === tabId && info.status === 'complete') {
@@ -333,11 +386,13 @@ async function injectInto(tabId) {
 }
 
 async function injectAll() {
-  const tabs = await chrome.tabs.query({ url: DEEPSEEK });
-  for (const t of tabs) await injectInto(t.id);
+  for (const site of Object.values(SITES)) {
+    const tabs = await chrome.tabs.query({ url: site.match });
+    for (const t of tabs) await injectInto(t.id);
+  }
 }
 
-async function sendToTab(tabId, msg) {
+async function sendToTab(tabId, msg, site) {
   let injected = false;
   for (let i = 0; i < 24; i++) {
     try {
@@ -350,7 +405,7 @@ async function sendToTab(tabId, msg) {
       await sleep(500);
     }
   }
-  throw new Error('could not reach the DeepSeek page: reload the chat.deepseek.com tab and try again');
+  throw new Error(`could not reach the ${site.name} page: reload the ${site.host} tab and try again`);
 }
 
 // ---- trusted input ------------------------------------------------------------
@@ -485,19 +540,29 @@ async function selfTest() {
   } catch (e) {
     add(false, 'Kai is not reachable: start it with "kai" in a terminal');
   }
-  const tab = await findTab();
-  if (!tab) {
-    add(false, 'no chat.deepseek.com tab is open: open it and log in');
-    return out;
+  let any = false;
+  for (const site of Object.values(SITES)) {
+    const tab = await findTab(site);
+    if (!tab) continue;
+    any = true;
+    await selfTestSite(site, tab, add);
   }
-  add(true, `DeepSeek tab found (${pathOf(tab.url) || '/'})`);
+  if (!any) {
+    const hosts = Object.values(SITES).map((s) => s.host).join(' or ');
+    add(false, `no ${hosts} tab is open: open the chat Kai should use and log in`);
+  }
+  return out;
+}
+
+async function selfTestSite(site, tab, add) {
+  add(true, `${site.name} tab found (${pathOf(tab.url) || '/'})`);
   if (chrome.debugger) {
     try {
       await chrome.debugger.attach({ tabId: tab.id }, '1.3');
       await chrome.debugger.detach({ tabId: tab.id });
-      add(true, 'trusted input is available (debugger protocol)');
+      add(true, `${site.name}: trusted input is available (debugger protocol)`);
     } catch (e) {
-      add(false, `trusted input unavailable (${errText(e)}): Kai will use DOM events`);
+      add(false, `${site.name}: trusted input unavailable (${errText(e)}): Kai will use DOM events`);
     }
   } else {
     add(false, 'trusted input unavailable: the debugger permission is missing');
@@ -512,13 +577,12 @@ async function selfTest() {
     }
   }
   if (!probe) {
-    add(false, 'the page does not answer: reload the DeepSeek tab');
-    return out;
+    add(false, `the ${site.name} page does not answer: reload the tab`);
+    return;
   }
-  add(probe.hooked, probe.hooked ? `network hook active (v${probe.hook.version})` : 'network hook is NOT active: reload the DeepSeek tab');
-  add(probe.hasInput, probe.hasInput ? 'chat input box found' : 'chat input box NOT found (logged in? page loaded?)');
-  if (probe.loggedOut) add(false, 'the tab shows the login page');
-  return out;
+  add(probe.hooked, probe.hooked ? `${site.name}: network hook active (v${probe.hook.version})` : `${site.name}: network hook is NOT active: reload the tab`);
+  add(probe.hasInput, probe.hasInput ? `${site.name}: chat input box found` : `${site.name}: chat input box NOT found (logged in? page loaded?)`);
+  if (probe.loggedOut) add(false, `${site.name}: the tab shows the login page`);
 }
 
 // ---- messages from the page and the popup ----------------------------------------
@@ -547,6 +611,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     case 'sent':
       log('info', `${msg.id}: the page started the completion request`);
       post({ id: msg.id, type: 'sent' });
+      return;
+    case 'chat_id':
+      if (sender.tab) noteChatId(sender.tab.id, msg.chatId, msg.host);
       return;
     case 'page_url':
       if (sender.tab) noteUrl(sender.tab.id, msg.url);

@@ -1,4 +1,4 @@
-// Runs in the DeepSeek tab (isolated world). It types Kai's prompt into the
+// Runs in the DeepSeek or Qwen tab (isolated world). It types Kai's prompt into the
 // chat box, sends it, and forwards what inject.js captures to background.js.
 (() => {
   if (window.__kaiContentLoaded) return; // injected twice (manifest + scripting): run once
@@ -8,6 +8,12 @@
   let probeWaiter = null;
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // The two supported chats differ only in these few details.
+  const QWEN = location.hostname.includes('qwen');
+  const HOST = location.hostname;
+  const NAME = QWEN ? 'Qwen' : 'DeepSeek';
+  const onLoginPage = () => (QWEN ? /\/auth|login|sign/ : /sign_in|login/).test(location.pathname);
 
   function relay(msg) {
     try {
@@ -80,6 +86,9 @@
         relay({ type: 'sent', id: m.id });
         break;
       }
+      case 'chat_id':
+        relay({ type: 'chat_id', id: m.id, chatId: m.chatId, host: location.host });
+        break;
       case 'chunk':
         relay({ type: 'sse', id: m.id, data: m.data });
         break;
@@ -137,25 +146,26 @@
       hooked: !!hook,
       hook,
       hasInput: !!findInput(),
-      loggedOut: /sign_in|login/.test(location.pathname),
+      loggedOut: onLoginPage(),
     };
   }
 
   async function doSend({ id, prompt }) {
     log('info', `send ${id}: page ${location.pathname}, prompt ${prompt.length} chars`);
 
-    if (/sign_in|login/.test(location.pathname)) {
-      return { ok: false, error: 'chat.deepseek.com is showing the login page: log in, then try again' };
+    if (onLoginPage()) {
+      return { ok: false, error: `${HOST} is showing the login page: log in, then try again` };
     }
 
-    const input = await waitFor(findInput, 30000);
+    let input = await waitFor(findInput, 30000);
     if (!input) {
       log('error', `no chat input on ${location.pathname} (title: ${document.title})`);
-      return { ok: false, error: 'the chat input box was not found (is DeepSeek logged in and fully loaded?)' };
+      return { ok: false, error: `the chat input box was not found (is ${NAME} logged in and fully loaded?)` };
     }
 
     window.postMessage({ kai: true, from: 'content', type: 'arm', id }, '*');
     await typePrompt(input, prompt);
+    if (QWEN) input = await readyToSend(input, prompt);
     const started = waitForStart(id, 12000);
     await pressEnter(input);
 
@@ -170,14 +180,37 @@
       log('info', clicked ? 'clicked the send button' : 'no usable send button found');
       if (await retry) return { ok: true };
     } else {
-      // The page took the text, so the request is probably waiting on DeepSeek's
-      // proof-of-work. Give it more time.
+      // The page took the text, so the request is probably still being prepared
+      // (DeepSeek's proof-of-work, Qwen creating the chat). Give it more time.
       if (await waitForStart(id, 25000)) return { ok: true };
     }
 
     window.postMessage({ kai: true, from: 'content', type: 'disarm' }, '*');
     log('error', `the page never sent the message (textarea chars: ${(input.value || '').length})`);
     return { ok: false, error: 'the page did not send the message (see logs.txt for what the page did)' };
+  }
+
+  // Qwen's send button is enabled only when the box has text AND the page is
+  // idle (it is something else while a reply is still being written, and Enter
+  // does nothing then). Typing a tool result right after a reply ends used to
+  // leave the text sitting in the box. So wait for the button, and type again
+  // if the page cleared the box meanwhile (it moves to the chat's own address
+  // a moment after the reply).
+  async function readyToSend(input, prompt) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const btn = await waitFor(() => findSendButton(input), attempt === 0 ? 30000 : 10000);
+      const have = (input.value || '').length;
+      if (btn && have === prompt.length) {
+        if (attempt > 0) log('info', 'the send button is ready');
+        return input;
+      }
+      log('warn', `Qwen is not ready to send (button ${btn ? 'enabled' : 'disabled'}, box has ${have} of ${prompt.length} chars): typing again`);
+      const fresh = (await waitFor(findInput, 10000)) || input;
+      input = fresh;
+      await typePrompt(input, prompt);
+    }
+    log('warn', 'Qwen never showed an enabled send button: trying Enter anyway');
+    return input;
   }
 
   function waitForStart(id, ms) {
@@ -203,6 +236,10 @@
   }
 
   function findInput() {
+    if (QWEN) {
+      const q = document.querySelector('textarea.message-input-textarea');
+      if (q && !q.disabled && !q.readOnly) return q;
+    }
     const byId = document.querySelector('textarea#chat-input');
     if (byId && !byId.disabled && !byId.readOnly) return byId;
     const boxes = [...document.querySelectorAll('textarea')].filter(
@@ -236,6 +273,13 @@
 
   // The send button is an icon-only button near the input.
   function findSendButton(input) {
+    if (QWEN) {
+      // <button class="send-button" aria-label="Send">; it is disabled while the box is empty.
+      const b = [...document.querySelectorAll('button.send-button, button[aria-label="Send"]')].find(
+        (x) => !x.disabled && !x.classList.contains('disabled')
+      );
+      if (b) return b;
+    }
     let box = input;
     for (let i = 0; i < 5 && box.parentElement; i++) box = box.parentElement;
     const buttons = [...box.querySelectorAll('[role="button"], button')].filter(

@@ -1,10 +1,11 @@
-// Runs inside the DeepSeek page (MAIN world). It wraps fetch (and XHR as a
+// Runs inside the DeepSeek or Qwen page (MAIN world). It wraps fetch (and XHR as a
 // fallback) so that, when Kai has just sent a message, the page's own
 // completion response is copied and its raw SSE text is handed to content.js.
 // The page itself sees the response untouched: it still does the
 // proof-of-work, the headers and the cookies.
 (() => {
-  const VERSION = 3;
+  const VERSION = 4;
+  const SITE_NAME = location.hostname.includes('qwen') ? 'Qwen' : 'DeepSeek';
   // A newer copy of this script (after an extension update) takes over; the
   // older one goes quiet instead of capturing everything twice.
   const token = Math.random().toString(36).slice(2);
@@ -25,6 +26,7 @@
       return String(url);
     }
   };
+  // DeepSeek: /api/v0/chat/completion   Qwen: /api/v2/chat/completions
   const isCompletionPath = (p) => p.includes('/chat/completion');
 
   window.addEventListener('message', (e) => {
@@ -70,6 +72,12 @@
       clearTimeout(armTimer);
       post({ type: 'sent', id: armed });
       log('info', `completion request started: ${method} ${path}`);
+      // Qwen names the chat in the request address (?chat_id=...). It is known
+      // before the page moves to the chat's own URL, so Kai can find the chat again.
+      try {
+        const cid = new URL(url, location.href).searchParams.get('chat_id');
+        if (cid) post({ type: 'chat_id', id: armed, chatId: cid });
+      } catch (_) {}
     } else if (armed && path.startsWith('/api/')) {
       log('info', `while armed, the page called ${method} ${path}`);
     } else if (!armed && completion) {
@@ -94,7 +102,7 @@
           }
           if (id) {
             if (!res.ok || !res.body) {
-              post({ type: 'error', id, message: `DeepSeek answered HTTP ${res.status} for ${path}` });
+              post({ type: 'error', id, message: `${SITE_NAME} answered HTTP ${res.status} for ${path}` });
             } else {
               relay(id, res.clone());
             }
@@ -167,7 +175,7 @@
         this.addEventListener('loadend', () => {
           pump();
           if (this.status >= 200 && this.status < 300) post({ type: 'end', id });
-          else post({ type: 'error', id, message: `DeepSeek answered HTTP ${this.status}` });
+          else post({ type: 'error', id, message: `${SITE_NAME} answered HTTP ${this.status}` });
         });
       }
       return send.apply(this, arguments);

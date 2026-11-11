@@ -1,15 +1,17 @@
 # Kai Bridge (Chrome extension)
 
-Connects the Kai terminal app to your DeepSeek web chat. Kai types its prompts
-into a chat.deepseek.com tab and reads the reply from the page's own stream,
-so DeepSeek's login, proof-of-work and cookies keep working exactly as they do
-for you. Nothing leaves your machine except the usual traffic to DeepSeek.
+Connects the Kai terminal app to your **DeepSeek** or **Qwen** web chat. Kai
+types its prompts into a chat.deepseek.com or chat.qwen.ai tab and reads the
+reply from the page's own stream, so the site's login, checks and cookies keep
+working exactly as they do for you. Nothing leaves your machine except the
+usual traffic to the chat you chose. Pick which one Kai uses in its provider
+menu (Ctrl+P → Switch provider: *DeepSeek Web* or *Qwen Web*).
 
 ## Set up (no token, no copy-paste)
 
 1. `chrome://extensions` → turn on **Developer mode** → **Load unpacked** → pick this `extension` folder.
    (Updating from an older version? Click the reload icon on the extension card.)
-2. Open https://chat.deepseek.com and log in. A tab that was already open is picked up automatically.
+2. Open https://chat.deepseek.com and/or https://chat.qwen.ai and log in. A tab that was already open is picked up automatically.
 3. Run `kai`. The extension popup says *Connected to Kai*.
 
 Set the page's DeepThink / Search toggles the way you want; Kai does not change them.
@@ -31,13 +33,15 @@ Set the page's DeepThink / Search toggles the way you want; Kai does not change 
 
 ## How it works
 
-- `inject.js` (page context) wraps `fetch` (and XHR as a fallback); after Kai sends a message it copies the `/api/v0/chat/completion` stream and passes the raw SSE text on.
+- `inject.js` (page context) wraps `fetch` (and XHR as a fallback); after Kai sends a message it copies the completion stream (`/api/v0/chat/completion` on DeepSeek, `/api/v2/chat/completions` on Qwen) and passes the raw SSE text on.
 - `content.js` types the prompt into the chat box and presses Enter (falls back to the send button). Typing, Enter and the send-button click go through Chrome's debugger protocol, so the page sees **trusted** input; if the debugger cannot attach (for example while DevTools is open) `content.js` falls back to DOM events.
 - `background.js` long-polls `http://127.0.0.1:8765/v1/poll` for commands and POSTs the SSE chunks and log lines back. The bridge only listens on localhost and rejects web pages.
 - The extension never reads, stores or replays your DeepSeek token or cookies: the page makes its own requests with its own session. The `debugger` permission is used only for input into the DeepSeek tab.
 
 ## Known limits
 
-- Selectors are heuristic (the chat is a `<textarea>`, Enter sends). If DeepSeek changes its page, `content.js` is the only file to touch.
+- Selectors are heuristic (the chat is a `<textarea>`, Enter sends; Qwen: `textarea.message-input-textarea` and `button.send-button`). If a site changes its page, `content.js` is the only file to touch.
+- A Qwen chat is recognised by its address `/c/<id>`. Kai keeps one chat per session and goes back to it if you wander off.
+- A session belongs to one site: switching between DeepSeek Web and Qwen Web starts a new chat with a short recap.
 - Trusted input needs the `debugger` permission and cannot attach while DevTools is open on the tab; the DOM fallback still works, but its events are synthetic and a page can tell them apart.
 - Stopping a reply in Kai stops relaying it; the page may keep generating until it finishes.
