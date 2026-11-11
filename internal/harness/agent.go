@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -297,4 +298,56 @@ func (g *progressGate) pending() *ToolProgress {
 		return g.latest
 	}
 	return nil
+}
+
+// stopAfterSame is how many identical failing calls in a row end a request:
+// a model that sends the same broken call four times is not going to fix it.
+const stopAfterSame = 4
+
+// failGuard watches one request for a model that keeps repeating a failing
+// call. It adds a firm instruction to the failing result (which the model
+// reads) and tells the loop when to give up. Both paths use it.
+type failGuard struct {
+	lastKey string
+	same    int            // identical call, failed this many times in a row
+	byTool  map[string]int // failures in a row per tool, whatever the arguments
+}
+
+// note looks at a finished call. It may extend r.Output with guidance. It
+// returns true when the request should stop.
+func (g *failGuard) note(reg *tools.Registry, c tools.Call, r *tools.Result) bool {
+	if g.byTool == nil {
+		g.byTool = map[string]int{}
+	}
+	if !r.IsError {
+		g.byTool[c.Name] = 0
+		g.lastKey, g.same = "", 0
+		return false
+	}
+	args, _ := json.Marshal(c.Args) // map keys are sorted: the same call gives the same text
+	key := c.Name + " " + string(args)
+	if key == g.lastKey {
+		g.same++
+	} else {
+		g.lastKey, g.same = key, 1
+	}
+	g.byTool[c.Name]++
+
+	usage := ""
+	if t, ok := reg.Get(c.Name); ok {
+		usage = " Usage: " + t.Spec().Usage() + "."
+	}
+	switch {
+	case g.same >= 2:
+		r.Output += fmt.Sprintf("\n\nSTOP: you sent this exact call %d times and it failed the same way each time. "+
+			"Sending it again will fail again. Read the error above and change the call, or use a different approach.%s", g.same, usage)
+	case g.byTool[c.Name] >= 3:
+		r.Output += fmt.Sprintf("\n\nNote: %q has failed %d times in a row. Stop guessing: re-read the error and the usage, "+
+			"and try a different approach if this one does not work.%s", c.Name, g.byTool[c.Name], usage)
+	}
+	return g.same >= stopAfterSame
+}
+
+func repeatError(name string) error {
+	return fmt.Errorf("the model kept sending the same failing %q call and was stopped; send your request again, or give it more detail", name)
 }

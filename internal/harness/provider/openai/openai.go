@@ -362,7 +362,7 @@ func (p *Provider) stream(ctx, reqCtx context.Context, cancel context.CancelFunc
 						}
 						frag := string(tc.Function.Arguments)
 						a.args.WriteString(frag)
-						if a.name == "edit_file" && frag != "" {
+						if (a.name == "edit_file" || a.name == "create_file") && frag != "" {
 							if pr, ok := a.scan.Feed(frag); ok && (!a.sentProg || pr != a.last) {
 								a.last, a.sentProg = pr, true
 								hp := pr

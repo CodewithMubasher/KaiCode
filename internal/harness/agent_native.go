@@ -135,6 +135,7 @@ func (a *Agent) loopNative(ctx context.Context, user string, emit func(Event) bo
 	a.record("user", user, "")
 	a.beginNativeRun(user)
 	defer a.closeOpenCalls()
+	var guard failGuard
 
 	for step := 0; step < a.cfg.MaxSteps; step++ {
 		calls, err := a.nativeTurn(ctx, emit)
@@ -153,25 +154,34 @@ func (a *Agent) loopNative(ctx context.Context, user string, emit func(Event) bo
 
 		for _, tc := range calls {
 			call, perr := toToolCall(tc)
-			c := call
+			c := a.cfg.Tools.Normalize(call)
 			if !emit(Event{Kind: EvToolCall, Call: &c}) {
 				return
 			}
 			var r tools.Result
 			if perr != nil {
 				// Not run: the model reads why and sends the call again.
-				r = tools.Result{ID: c.ID, Name: c.Name, IsError: true, Output: perr.Error()}
+				out := perr.Error()
+				if h := a.cfg.Tools.Help(c.Name); h != "" {
+					out += "\n" + h
+				}
+				r = tools.Result{ID: c.ID, Name: c.Name, IsError: true, Output: out, Short: perr.Error()}
 			} else {
 				r = a.cfg.Tools.Execute(ctx, c, a.cfg.ToolTimeout)
 			}
 			if ctx.Err() != nil {
 				return
 			}
+			stop := guard.note(a.cfg.Tools, c, &r)
 			if !emit(Event{Kind: EvToolResult, Call: &c, Result: &r}) {
 				return
 			}
 			a.record("tool", r.Output, "")
 			a.appendMsg(toolMessage(tc.ID, r))
+			if stop {
+				emit(Event{Kind: EvError, Err: repeatError(c.Name)})
+				return
+			}
 		}
 	}
 	emit(Event{Kind: EvError, Err: fmt.Errorf("stopped after %d steps without a final answer", a.cfg.MaxSteps)})

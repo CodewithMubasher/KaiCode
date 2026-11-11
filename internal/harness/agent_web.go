@@ -48,6 +48,7 @@ func (a *Agent) loopWeb(ctx context.Context, user string, emit func(Event) bool)
 	body := user // what to say next, without Kai's instructions
 	repairs := 0
 	recovered := false
+	var guard failGuard
 
 	for step := 0; step < a.cfg.MaxSteps; step++ {
 		res, err := a.turn(ctx, a.prepare(body), emit)
@@ -85,7 +86,7 @@ func (a *Agent) loopWeb(ctx context.Context, user string, emit func(Event) bool)
 
 		results := make([]tools.Result, 0, len(res.calls))
 		for i := range res.calls {
-			c := res.calls[i]
+			c := a.cfg.Tools.Normalize(res.calls[i])
 			if !emit(Event{Kind: EvToolCall, Call: &c}) {
 				return
 			}
@@ -93,11 +94,16 @@ func (a *Agent) loopWeb(ctx context.Context, user string, emit func(Event) bool)
 			if ctx.Err() != nil {
 				return
 			}
+			stop := guard.note(a.cfg.Tools, c, &r)
 			if !emit(Event{Kind: EvToolResult, Call: &c, Result: &r}) {
 				return
 			}
 			a.record("tool", r.Output, "")
 			results = append(results, r)
+			if stop {
+				emit(Event{Kind: EvError, Err: repeatError(c.Name)})
+				return
+			}
 		}
 		body = dsml.EncodeResults(results)
 	}
@@ -180,7 +186,7 @@ read:
 				visible := p.Feed(ev.Text)
 				a.addTokens(EstimateTokens(ev.Text))
 				usage(false)
-				if tp, ok := p.Progress(); ok && tp.Name == "edit_file" {
+				if tp, ok := p.Progress(); ok && (tp.Name == "edit_file" || tp.Name == "create_file") {
 					hp := &ToolProgress{Name: tp.Name, Path: tp.Path, Lines: tp.Lines, Creating: tp.Creating}
 					if gate.offer(hp) {
 						if !emit(Event{Kind: EvToolProgress, Progress: hp}) {

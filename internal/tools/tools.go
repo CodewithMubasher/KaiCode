@@ -21,6 +21,13 @@ type Param struct {
 	Type        string // JSON schema type: string, integer, number, boolean, array, object
 	Description string
 	Required    bool
+	// Aliases are other names models commonly use for this parameter
+	// ("cmd" for "command"). They are accepted and renamed before the call
+	// is checked, so a harmless naming slip does not cost a round trip.
+	Aliases []string
+	// Example is a realistic value, used in the usage examples that teach
+	// the model how to call the tool.
+	Example string
 }
 
 // Spec describes a tool to the model.
@@ -57,6 +64,52 @@ func (s Spec) JSON() string {
 	return string(b)
 }
 
+// Usage describes the tool's parameters on one line, for error messages.
+func (s Spec) Usage() string {
+	parts := make([]string, 0, len(s.Params))
+	for _, p := range s.Params {
+		typ := p.Type
+		if typ == "" {
+			typ = "string"
+		}
+		req := "optional"
+		if p.Required {
+			req = "required"
+		}
+		parts = append(parts, fmt.Sprintf("%s (%s, %s)", p.Name, typ, req))
+	}
+	return s.Name + "(" + strings.Join(parts, ", ") + ")"
+}
+
+// ExampleArgs is a valid example of the call's arguments as JSON: every
+// required parameter, filled with its Example value.
+func (s Spec) ExampleArgs() string {
+	m := map[string]any{}
+	for _, p := range s.Params {
+		if !p.Required {
+			continue
+		}
+		ex := p.Example
+		if ex == "" {
+			ex = "<" + p.Name + ">"
+		}
+		switch p.Type {
+		case "integer", "number":
+			var n float64
+			if _, err := fmt.Sscan(ex, &n); err == nil {
+				m[p.Name] = n
+				continue
+			}
+		case "boolean":
+			m[p.Name] = ex == "true"
+			continue
+		}
+		m[p.Name] = ex
+	}
+	b, _ := json.Marshal(m)
+	return string(b)
+}
+
 // Tool is something the model can call.
 type Tool interface {
 	Spec() Spec
@@ -76,6 +129,9 @@ type Result struct {
 	Name    string
 	Output  string
 	IsError bool
+	// Short is a one-line summary of an error for the person using Kai, set
+	// when Output is long guidance meant for the model. Empty otherwise.
+	Short string
 }
 
 // Registry holds the tools available to the agent.
@@ -118,6 +174,32 @@ func (r *Registry) Names() []string {
 	return out
 }
 
+// Normalize returns the call with parameter aliases renamed and loose types
+// fixed, as Execute will run it. The UI shows this version, so a call that
+// used "cmd" for "command" is still drawn properly. A call that cannot be
+// fixed is returned unchanged.
+func (r *Registry) Normalize(c Call) Call {
+	t, ok := r.tools[c.Name]
+	if !ok {
+		return c
+	}
+	if args, problem := normalizeArgs(t.Spec(), c.Args); problem == "" {
+		c.Args = args
+	}
+	return c
+}
+
+// Help is the correct usage and an example call of a tool, or "" for an
+// unknown tool. It is added to errors that happen before a call can run.
+func (r *Registry) Help(name string) string {
+	t, ok := r.tools[name]
+	if !ok {
+		return ""
+	}
+	s := t.Spec()
+	return "Correct usage: " + s.Usage() + "\nExample arguments: " + s.ExampleArgs()
+}
+
 // Execute runs one call. It never fails: problems (unknown tool, missing
 // argument, error, panic, timeout) come back as an error Result so the model
 // can read them and correct itself.
@@ -126,16 +208,19 @@ func (r *Registry) Execute(ctx context.Context, c Call, timeout time.Duration) R
 	t, ok := r.tools[c.Name]
 	if !ok {
 		res.IsError = true
-		res.Output = fmt.Sprintf("unknown tool %q. Available tools: %s", c.Name, strings.Join(r.Names(), ", "))
+		res.Output = fmt.Sprintf("unknown tool %q. Available tools: %s. Call one of these by its exact name; do not invent tool names.", c.Name, strings.Join(r.Names(), ", "))
+		res.Short = fmt.Sprintf("unknown tool %q", c.Name)
 		return res
 	}
-	for _, p := range t.Spec().Params {
-		if _, has := c.Args[p.Name]; p.Required && !has {
-			res.IsError = true
-			res.Output = fmt.Sprintf("missing required parameter %q for tool %q", p.Name, c.Name)
-			return res
-		}
+	spec := t.Spec()
+	args, problem := normalizeArgs(spec, c.Args)
+	if problem != "" {
+		res.IsError = true
+		res.Short = problem
+		res.Output = problem + ".\n" + argHelp(spec, c.Args)
+		return res
 	}
+	c.Args = args
 	if timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
@@ -147,7 +232,13 @@ func (r *Registry) Execute(ctx context.Context, c Call, timeout time.Duration) R
 		if out != "" {
 			out += "\n"
 		}
+		if out == "" {
+			res.Short = err.Error() // nothing partial to show: the person gets the reason alone
+		}
 		out += err.Error()
+		if strings.Contains(err.Error(), "parameter") {
+			out += "\n" + argHelp(spec, c.Args)
+		}
 	}
 	res.Output = Truncate(out, MaxOutput)
 	return res
@@ -182,4 +273,71 @@ func Truncate(s string, max int) string {
 func StringArg(args map[string]any, name string) (string, bool) {
 	s, ok := args[name].(string)
 	return s, ok
+}
+
+// normalizeArgs checks a call's arguments against the spec. It renames known
+// aliases, turns numbers, booleans and string lists into text where the
+// parameter is text, and reports the first problem (missing or wrong type) as
+// a short sentence. The caller's map is never changed.
+func normalizeArgs(spec Spec, in map[string]any) (map[string]any, string) {
+	args := make(map[string]any, len(in))
+	for k, v := range in {
+		args[k] = v
+	}
+	for _, p := range spec.Params {
+		if _, has := args[p.Name]; !has {
+			for _, a := range p.Aliases {
+				if v, ok := args[a]; ok {
+					args[p.Name] = v
+					delete(args, a)
+					break
+				}
+			}
+		}
+		v, has := args[p.Name]
+		if !has || v == nil {
+			if p.Required {
+				return nil, fmt.Sprintf("missing required parameter %q for tool %q", p.Name, spec.Name)
+			}
+			delete(args, p.Name)
+			continue
+		}
+		if p.Type == "" || p.Type == "string" {
+			switch x := v.(type) {
+			case string:
+			case float64, bool:
+				args[p.Name] = fmt.Sprint(x)
+			case []any:
+				parts := make([]string, 0, len(x))
+				for _, e := range x {
+					s, ok := e.(string)
+					if !ok {
+						return nil, fmt.Sprintf("parameter %q of tool %q must be a string, not a list", p.Name, spec.Name)
+					}
+					parts = append(parts, s)
+				}
+				args[p.Name] = strings.Join(parts, " ")
+			default:
+				return nil, fmt.Sprintf("parameter %q of tool %q must be a string", p.Name, spec.Name)
+			}
+		}
+	}
+	return args, ""
+}
+
+// argHelp is the part of an argument error that teaches the model: what it
+// sent, the correct usage and a working example.
+func argHelp(spec Spec, sent map[string]any) string {
+	got := "no arguments"
+	if len(sent) > 0 {
+		keys := make([]string, 0, len(sent))
+		for k := range sent {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		got = "only these parameters: " + strings.Join(keys, ", ")
+	}
+	return fmt.Sprintf("You sent %s.\nCorrect usage: %s\nExample arguments: %s\n"+
+		"Send the call again with every required parameter, spelled exactly as above. Do not repeat the same call unchanged.",
+		got, spec.Usage(), spec.ExampleArgs())
 }

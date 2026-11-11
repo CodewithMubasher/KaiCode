@@ -28,9 +28,12 @@ func (EditFile) Spec() Spec {
 			"To create a new file, leave old_string empty and put the whole content in new_string; the file must not exist yet. " +
 			"Read the file first so old_string is copied from its real text. For renaming, moving, deleting or bulk rewrites use the shell tool.",
 		Params: []Param{
-			{Name: "path", Type: "string", Description: "Path of the file, relative to the working directory.", Required: true},
-			{Name: "old_string", Type: "string", Description: "The exact text to replace. Empty to create a new file."},
-			{Name: "new_string", Type: "string", Description: "The replacement text (empty to delete old_string).", Required: true},
+			{Name: "path", Type: "string", Description: "Path of the file, relative to the working directory.", Required: true,
+			Aliases: []string{"file_path", "filepath", "file", "filename", "file_name", "filePath"}, Example: "src/main.go"},
+			{Name: "old_string", Type: "string", Description: "The exact text to replace. Empty to create a new file.",
+				Aliases: []string{"old_str", "old_text", "old", "search", "find", "target"}, Example: "old text"},
+			{Name: "new_string", Type: "string", Description: "The replacement text (empty to delete old_string).", Required: true,
+				Aliases: []string{"new_str", "new_text", "new", "replace", "replacement", "replace_with", "content"}, Example: "new text"},
 			{Name: "replace_all", Type: "boolean", Description: "Optional. Replace every occurrence of old_string instead of requiring exactly one."},
 		},
 	}

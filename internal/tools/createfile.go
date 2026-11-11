@@ -14,10 +14,12 @@ type CreateFile struct{}
 func (CreateFile) Spec() Spec {
 	return Spec{
 		Name:        "create_file",
-		Description: "Create a new file or overwrite an existing one with the specified content.",
+		Description: "Create a new file, or overwrite an existing one, with the complete content you give. Use it for new files and full rewrites; use edit_file to change part of an existing file.",
 		Params: []Param{
-			{Name: "path", Type: "string", Description: "Path of the file, relative to the working directory.", Required: true},
-			{Name: "content", Type: "string", Description: "Content to write to the file.", Required: true},
+			{Name: "path", Type: "string", Description: "Path of the file, relative to the working directory.", Required: true,
+			Aliases: []string{"file_path", "filepath", "file", "filename", "file_name", "filePath"}, Example: "src/main.go"},
+			{Name: "content", Type: "string", Description: "Complete content of the file.", Required: true,
+				Aliases: []string{"contents", "text", "body", "file_content", "data", "new_string"}, Example: "package main\n"},
 		},
 	}
 }

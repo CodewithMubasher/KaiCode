@@ -14,7 +14,8 @@ func (ReadFile) Spec() Spec {
 		Name:        "read_file",
 		Description: "Read a text file and return its contents.",
 		Params: []Param{
-			{Name: "path", Type: "string", Description: "Path of the file, relative to the working directory.", Required: true},
+			{Name: "path", Type: "string", Description: "Path of the file, relative to the working directory.", Required: true,
+			Aliases: []string{"file_path", "filepath", "file", "filename", "file_name", "filePath"}, Example: "src/main.go"},
 		},
 	}
 }

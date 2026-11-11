@@ -152,8 +152,10 @@ func (Shell) Spec() Spec {
 			"and has no keyboard input: never start interactive programs, servers or file watchers. " +
 			"Long output is shortened to its start and end, so narrow it (grep, head, -First) rather than printing whole large files.",
 		Params: []Param{
-			{Name: "command", Type: "string", Description: "The command line to run.", Required: true},
-			{Name: "timeout_seconds", Type: "integer", Description: "Optional. Seconds before the command is stopped (default 60, maximum 600)."},
+			{Name: "command", Type: "string", Description: "The command line to run.", Required: true,
+				Aliases: []string{"cmd", "script", "bash", "sh", "input", "code", "cmdline", "commands"}, Example: "ls -la"},
+			{Name: "timeout_seconds", Type: "integer", Description: "Optional. Seconds before the command is stopped (default 60, maximum 600).",
+				Aliases: []string{"timeout", "timeout_secs"}, Example: "60"},
 		},
 	}
 }
