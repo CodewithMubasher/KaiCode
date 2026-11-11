@@ -42,6 +42,20 @@ func decodeString(t *testing.T, s string) []harness.StreamEvent {
 	return collect(t, Decode(context.Background(), strings.NewReader(s)))
 }
 
+func TestRealUsageIsReported(t *testing.T) {
+	evs := decodeString(t, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\",\"phase\":\"answer\",\"status\":\"typing\"}}],\"usage\":{\"prompt_tokens\":900,\"completion_tokens\":12,\"total_tokens\":912}}\n\ndata: [DONE]\n\n")
+	var got *harness.Usage
+	for _, e := range evs {
+		if e.Kind == harness.StreamUsage && e.Usage != nil {
+			u := *e.Usage
+			got = &u
+		}
+	}
+	if got == nil || got.Total() != 912 || got.PromptTokens != 900 {
+		t.Fatalf("usage = %+v, want the provider's real count", got)
+	}
+}
+
 func lastError(evs []harness.StreamEvent) error {
 	for _, e := range evs {
 		if e.Kind == harness.StreamError {

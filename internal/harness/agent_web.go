@@ -7,13 +7,13 @@ import (
 	"log/slog"
 	"strings"
 
-	"kai/internal/harness/dsml"
 	"kai/internal/tools"
 )
 
-// This file is the DSML path: DeepSeek Web, a text-only chat. It is used only
-// when the agent's backend is a Provider. Nothing here runs for a native
-// (OpenAI-compatible) provider; that path lives in agent_native.go.
+// This file is the text-protocol path: DeepSeek Web (DSML) and Qwen Web (the
+// strict JSON protocol). It is used only when the agent's backend is a
+// Provider. Nothing here runs for a native (OpenAI-compatible) provider; that
+// path lives in agent_native.go.
 
 // prepare wraps body for sending. The first message of a chat also carries
 // Kai's instructions and the tool block (the web chat has no system role).
@@ -28,7 +28,14 @@ func (a *Agent) prepare(body string) string {
 		body = "The earlier chat was lost, so this is a fresh chat. Recap of the conversation so far:\n\n" +
 			a.recap + "\n\nContinue from here.\n\n" + body
 	}
-	return dsml.FirstPrompt(a.cfg.System, a.cfg.Tools.Specs(), body)
+	return firstPrompt(ProtocolOf(a.cfg.Provider), a.cfg.System, a.cfg.Tools.Specs(), body)
+}
+
+// protocol reports the text protocol of the provider in use.
+func (a *Agent) protocol() ToolProtocol {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return ProtocolOf(a.cfg.Provider)
 }
 
 // restartChat drops the web chat's position and prepares a recap from Kai's
@@ -45,6 +52,7 @@ func (a *Agent) restartChat() {
 
 func (a *Agent) loopWeb(ctx context.Context, user string, emit func(Event) bool) {
 	a.record("user", user, "")
+	proto := a.protocol()
 	body := user // what to say next, without Kai's instructions
 	repairs := 0
 	recovered := false
@@ -80,7 +88,7 @@ func (a *Agent) loopWeb(ctx context.Context, user string, emit func(Event) bool)
 				return
 			}
 			repairs++
-			body = dsml.RepairPrompt(res.problem)
+			body = repairPrompt(proto, res.problem)
 			continue
 		}
 
@@ -105,7 +113,7 @@ func (a *Agent) loopWeb(ctx context.Context, user string, emit func(Event) bool)
 				return
 			}
 		}
-		body = dsml.EncodeResults(results)
+		body = encodeResults(proto, a.cfg.Tools.Specs(), results)
 	}
 	emit(Event{Kind: EvError, Err: fmt.Errorf("stopped after %d steps without a final answer", a.cfg.MaxSteps)})
 }
@@ -138,13 +146,14 @@ func (a *Agent) turn(ctx context.Context, prompt string, emit func(Event) bool) 
 	// prompt (instructions and tool specs included, on the first turn) plus
 	// every delta the model streams, markup and all.
 	used := -1
+	exact := false
 	usage := func(force bool) {
 		tok := a.tokensNow()
 		if tok == used || (!force && tok-used < 40) {
 			return
 		}
 		used = tok
-		emit(Event{Kind: EvUsage, Tokens: tok})
+		emit(Event{Kind: EvUsage, Tokens: tok, Exact: exact})
 	}
 	a.addTokens(EstimateTokens(prompt))
 	usage(true)
@@ -158,7 +167,7 @@ func (a *Agent) turn(ctx context.Context, prompt string, emit func(Event) bool) 
 		return emit(Event{Kind: EvText, Text: s})
 	}
 
-	p := dsml.NewParser()
+	p := newReplyParser(a.protocol())
 	ended := false
 	var gate progressGate
 
@@ -177,14 +186,18 @@ read:
 			case StreamReady:
 				a.setParent(ev.MessageID)
 			case StreamThinking:
-				a.addTokens(EstimateTokens(ev.Text))
+				if !exact {
+					a.addTokens(EstimateTokens(ev.Text))
+				}
 				usage(false)
 				if !emit(Event{Kind: EvThinking, Text: ev.Text}) {
 					return res, ctx.Err()
 				}
 			case StreamText:
 				visible := p.Feed(ev.Text)
-				a.addTokens(EstimateTokens(ev.Text))
+				if !exact {
+					a.addTokens(EstimateTokens(ev.Text))
+				}
 				usage(false)
 				if tp, ok := p.Progress(); ok && (tp.Name == "edit_file" || tp.Name == "create_file") {
 					hp := &ToolProgress{Name: tp.Name, Path: tp.Path, Lines: tp.Lines, Creating: tp.Creating}
@@ -196,6 +209,16 @@ read:
 				}
 				if !show(visible) {
 					return res, ctx.Err()
+				}
+			case StreamUsage:
+				// Qwen (and some other web chats) report the real token usage
+				// in the reply stream. Use it instead of the estimate.
+				if ev.Usage != nil {
+					if n := ev.Usage.Total(); n > 0 {
+						exact = true
+						a.setTokens(n)
+						usage(true)
+					}
 				}
 			case StreamEnd:
 				ended = true

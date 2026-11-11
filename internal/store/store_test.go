@@ -102,3 +102,38 @@ func TestSettingsAndReopen(t *testing.T) {
 		t.Fatalf("setting after reopen: %q %v", v, ok)
 	}
 }
+
+// The token count and the rendered timeline must survive a close and reopen.
+func TestSessionTokensAndStatePersist(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "kai.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if err := s.CreateSession(Session{ID: "s1", Title: "work", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AppendMessage("s1", "user", "hello", now); err != nil {
+		t.Fatal(err)
+	}
+	const state = `{"messages":[{"Role":1,"Text":"done"}]}`
+	if err := s.SaveSessionState("s1", state, 4321); err != nil {
+		t.Fatal(err)
+	}
+	_ = s.Close()
+
+	s, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	x, err := s.Session("s1")
+	if err != nil || x.Tokens != 4321 {
+		t.Fatalf("tokens after reopen: %+v %v", x, err)
+	}
+	got, err := s.SessionState("s1")
+	if err != nil || got != state {
+		t.Fatalf("state after reopen: %q %v", got, err)
+	}
+}

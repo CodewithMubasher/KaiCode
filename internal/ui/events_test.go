@@ -79,16 +79,17 @@ func TestCreateFileShowsFullContentAsNode(t *testing.T) {
 	}
 }
 
-func TestEditShowsDiffNode(t *testing.T) {
+func TestEditShowsCollapsedDiffNode(t *testing.T) {
 	m := testModel()
 	args := map[string]any{"path": "x.go", "old_string": "a := 1", "new_string": "a := 2"}
 	m = m.applyEvent(harness.Event{Kind: harness.EvToolCall, Call: call("edit_file", args)})
 	m = m.applyEvent(harness.Event{Kind: harness.EvToolResult, Call: call("edit_file", args), Result: &tools.Result{Output: "Edited x.go: 1 replacement(s), first at line 7.\n- a := 1\n+ a := 2"}})
 	v := view(m)
-	for _, want := range []string{"Edited x.go", "- a := 1", "+ a := 2", "7"} {
-		if !strings.Contains(v, want) {
-			t.Errorf("missing %q:\n%s", want, v)
-		}
+	if !strings.Contains(v, "Edited x.go") {
+		t.Errorf("missing the heading:\n%s", v)
+	}
+	if strings.Contains(v, "a := 1") || strings.Contains(v, "a := 2") {
+		t.Errorf("a finished edit node should be collapsed until clicked:\n%s", v)
 	}
 }
 

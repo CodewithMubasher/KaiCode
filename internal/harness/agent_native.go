@@ -201,13 +201,14 @@ func (a *Agent) nativeTurn(ctx context.Context, emit func(Event) bool) (calls []
 	}
 
 	shown := -1
+	exact := false
 	usage := func(force bool) {
 		tok := a.tokensNow()
 		if tok == shown || (!force && tok-shown < 40) {
 			return
 		}
 		shown = tok
-		emit(Event{Kind: EvUsage, Tokens: tok})
+		emit(Event{Kind: EvUsage, Tokens: tok, Exact: exact})
 	}
 	usage(true)
 
@@ -235,17 +236,29 @@ read:
 			switch ev.Kind {
 			case StreamThinking:
 				reasoning.WriteString(ev.Text)
-				a.addTokens(EstimateTokens(ev.Text))
+				if !exact {
+					a.addTokens(EstimateTokens(ev.Text))
+				}
 				usage(false)
 				if !emit(Event{Kind: EvThinking, Text: ev.Text}) {
 					return nil, ctx.Err()
 				}
 			case StreamText:
 				text.WriteString(ev.Text)
-				a.addTokens(EstimateTokens(ev.Text))
+				if !exact {
+					a.addTokens(EstimateTokens(ev.Text))
+				}
 				usage(false)
 				if !emit(Event{Kind: EvText, Text: ev.Text}) {
 					return nil, ctx.Err()
+				}
+			case StreamUsage:
+				if ev.Usage != nil {
+					if n := ev.Usage.Total(); n > 0 {
+						exact = true
+						a.setTokens(n)
+						usage(true)
+					}
 				}
 			case StreamToolProgress:
 				if ev.Tool != nil {
@@ -257,7 +270,9 @@ read:
 			case StreamToolCall:
 				if ev.ToolCall != nil {
 					calls = append(calls, *ev.ToolCall)
-					a.addTokens(EstimateTokens(ev.ToolCall.Name) + EstimateTokens(ev.ToolCall.Arguments))
+					if !exact {
+						a.addTokens(EstimateTokens(ev.ToolCall.Name) + EstimateTokens(ev.ToolCall.Arguments))
+					}
 				}
 			case StreamEnd:
 				ended = true

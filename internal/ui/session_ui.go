@@ -64,6 +64,10 @@ func (m Model) openSessionPicker(kind pickerKind) (Model, tea.Cmd) {
 }
 
 func (m Model) loadSession(id string) (Model, tea.Cmd) {
+	// Save what is on screen first: switching away must never lose the
+	// timeline of the session being left.
+	m = m.saveState()
+
 	msgs, err := m.st.Messages(id)
 	if err != nil {
 		slog.Warn("could not load the session", "session", id, "err", err)
@@ -76,35 +80,52 @@ func (m Model) loadSession(id string) (Model, tea.Cmd) {
 	} else {
 		m.run.tokens = 0
 	}
+	state, hasState := loadSessionState(m.st, id)
 
 	m = m.stopRun()
 	var entries []harness.Entry
 	for _, x := range msgs {
 		entries = append(entries, harness.Entry{Role: x.Role, Text: x.Text, At: x.At})
 	}
-	m.run.agent.Resume(entries)
+	if hasState {
+		m.run.agent.ResumeWithState(entries, state.Agent)
+	} else {
+		m.run.agent.Resume(entries)
+	}
 
 	m.chat = m.chat.Clear()
-	for _, x := range msgs {
-		switch x.Role {
-		case "user":
-			m.chat = m.chat.AppendUser(x.Text)
-		case "assistant":
-			// Unmarshal the saved steps to restore the file blocks!
-			var steps []components.Step
-			if x.Steps != "" {
-				_ = json.Unmarshal([]byte(x.Steps), &steps)
-			}
-			m.chat = m.chat.AppendAssistantWithSteps(x.Text, steps)
-		case "tool":
-			// Skip generic tools, we've restored the pretty ones above
-		}
+	restored := false
+	if hasState && len(state.Messages) > 0 {
+		m.chat = m.chat.Restore(state.Messages)
+		restored = true
 	}
+	if !restored {
+		// A session saved by an older version has no state blob: rebuild the
+		// chat from the messages, step data included when it was saved.
+		var saved []components.Message
+		for _, x := range msgs {
+			switch x.Role {
+			case "user":
+				saved = append(saved, components.Message{Role: components.RoleUser, Text: x.Text})
+			case "assistant":
+				var steps []components.Step
+				if x.Steps != "" {
+					_ = json.Unmarshal([]byte(x.Steps), &steps)
+				}
+				saved = append(saved, components.Message{Role: components.RoleAssistant, Text: x.Text, Steps: steps})
+			}
+		}
+		m.chat = m.chat.Restore(saved)
+	}
+	if state.Tokens > 0 {
+		m.run.tokens = state.Tokens
+	}
+	m.run.savedTokens = m.run.tokens
 	m.ps.use(id)
 	m.screen = ScreenChat
 	m.state, m.fake = StateIdle, nil
 	m.input = m.input.Reset().SetPlaceholder("Type a message...")
-	slog.Info("session switched", "session", id, "messages", len(entries))
+	slog.Info("session switched", "session", id, "messages", len(entries), "timeline", restored)
 	return m.setNotice("? Switched session")
 }
 
@@ -113,6 +134,7 @@ func (m Model) deleteSession(id string) (Model, tea.Cmd) {
 		return m.setNotice("Could not delete that session")
 	}
 	if id == m.ps.current() {
+		m.ps.begin() // the deleted id must not be saved again by newSession
 		m = m.newSession()
 	}
 	return m.setNotice("? Session deleted")

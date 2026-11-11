@@ -40,6 +40,7 @@ type reply struct {
 	err            error
 	calls          []harness.ToolCall
 	progress       []harness.ToolProgress
+	usage          *harness.Usage
 }
 
 func collectAll(t *testing.T, ch <-chan harness.StreamEvent) (r reply) {
@@ -65,6 +66,9 @@ func collectAll(t *testing.T, ch <-chan harness.StreamEvent) (r reply) {
 				r.calls = append(r.calls, *e.ToolCall)
 			case harness.StreamToolProgress:
 				r.progress = append(r.progress, *e.Tool)
+			case harness.StreamUsage:
+				u := *e.Usage
+				r.usage = &u
 			}
 		case <-timeout:
 			t.Fatal("stream did not finish")
@@ -136,6 +140,27 @@ func TestChatSendsSystemToolsAndStreams(t *testing.T) {
 	}
 	if raw, _ := json.Marshal(b); strings.Contains(string(raw), "DSML") {
 		t.Fatal("DSML must never appear in a native request")
+	}
+}
+
+func TestRealUsageIsForwarded(t *testing.T) {
+	var bodies []map[string]any
+	srv := serve(t, &bodies,
+		`{"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}`,
+		`{"choices":[],"usage":{"prompt_tokens":120,"completion_tokens":3,"total_tokens":123}}`,
+		`[DONE]`)
+	p := New(Config{BaseURL: srv.URL, Model: "m"})
+	ch, err := p.Chat(context.Background(), harness.ChatRequest{Messages: []harness.ChatMessage{{Role: "user", Content: "hi"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := collectAll(t, ch)
+	if r.usage == nil || r.usage.Total() != 123 || r.usage.PromptTokens != 120 {
+		t.Fatalf("usage = %+v, want the provider's real count", r.usage)
+	}
+	opts, ok := bodies[0]["stream_options"].(map[string]any)
+	if !ok || opts["include_usage"] != true {
+		t.Fatalf("the request must ask for usage, got %v", bodies[0]["stream_options"])
 	}
 }
 

@@ -69,7 +69,11 @@ var rootCmd = &cobra.Command{
 		}
 
 		p := tea.NewProgram(ui.NewModel(cfg, st))
-		if _, err := p.Run(); err != nil {
+		final, err := p.Run()
+		if fm, ok := final.(ui.Model); ok {
+			fm.Shutdown() // save the open session and its timeline
+		}
+		if err != nil {
 			logger.Error("tui crashed", "err", err)
 			return err
 		}

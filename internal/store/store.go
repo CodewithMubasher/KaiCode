@@ -1,4 +1,4 @@
-﻿// Package store keeps everything Kai remembers in one SQLite file: custom
+// Package store keeps everything Kai remembers in one SQLite file: custom
 // providers, sessions, their messages, and small settings such as the active
 // provider. It uses modernc.org/sqlite, a pure-Go driver, so no C compiler is
 // needed.
@@ -58,6 +58,14 @@ var migrations = []string{
 		key   TEXT PRIMARY KEY,
 		value TEXT NOT NULL
 	);`,
+
+	// Session state added after the first release: the real token count the
+	// provider reported, and one JSON blob holding everything the person saw
+	// (including every timeline node), so a reopened session looks exactly as
+	// it did when it was closed.
+	`ALTER TABLE sessions ADD COLUMN tokens INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE sessions ADD COLUMN state TEXT NOT NULL DEFAULT '';
+	ALTER TABLE messages ADD COLUMN steps TEXT NOT NULL DEFAULT '';`,
 }
 
 // Open opens (and creates, and migrates) the database at path.
@@ -231,11 +239,11 @@ func affected(res sql.Result, err error) error {
 
 // Session is one saved conversation.
 type Session struct {
-ID        string
-Title     string
-Provider  string
-Cwd       string
-Tokens    int
+	ID        string
+	Title     string
+	Provider  string
+	Cwd       string
+	Tokens    int
 	CreatedAt time.Time
 	UpdatedAt time.Time
 	Messages  int // filled by Sessions and Session
@@ -249,13 +257,13 @@ func (s *Store) CreateSession(x Session) error {
 	return err
 }
 
-const sessionCols = `s.id, s.title, s.provider, s.cwd, s.created_at, s.updated_at,
+const sessionCols = `s.id, s.title, s.provider, s.cwd, s.tokens, s.created_at, s.updated_at,
 	(SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id)`
 
 func scanSession(sc interface{ Scan(...any) error }) (Session, error) {
 	var x Session
 	var created, updated int64
-	if err := sc.Scan(&x.ID, &x.Title, &x.Provider, &x.Cwd, &created, &updated, &x.Messages); err != nil {
+	if err := sc.Scan(&x.ID, &x.Title, &x.Provider, &x.Cwd, &x.Tokens, &created, &updated, &x.Messages); err != nil {
 		return x, err
 	}
 	x.CreatedAt, x.UpdatedAt = fromMS(created), fromMS(updated)
@@ -310,25 +318,50 @@ func (s *Store) TouchSession(id, provider string) error {
 	return err
 }
 
+// SessionState returns the saved JSON state of a session (its chat and agent
+// state), or "" when the session has none yet.
+func (s *Store) SessionState(id string) (string, error) {
+	var state string
+	err := s.db.QueryRow(`SELECT state FROM sessions WHERE id = ?`, id).Scan(&state)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	return state, err
+}
+
+// SaveSessionState stores the JSON state of a session together with its token
+// count. It only updates the row: the session itself is created by the first
+// recorded message.
+func (s *Store) SaveSessionState(id, state string, tokens int) error {
+	res, err := s.db.Exec(`UPDATE sessions SET state = ?, tokens = ? WHERE id = ?`, state, tokens, id)
+	return affected(res, err)
+}
+
 // ---- messages --------------------------------------------------------------
 
 // Message is one entry of a session: role is "user", "assistant" or "tool".
 type Message struct {
-	ID        int64
-	Role      string
-	Text      string
-	Steps     string
-	At        time.Time
+	ID    int64
+	Role  string
+	Text  string
+	Steps string
+	At    time.Time
 }
 
 // AppendMessage adds a message to a session and bumps its updated time.
 func (s *Store) AppendMessage(sessionID, role, text string, at time.Time) error {
+	return s.AppendMessageSteps(sessionID, role, text, "", at)
+}
+
+// AppendMessageSteps adds a message with an optional JSON rendering of what
+// the person saw for it (timeline nodes), and bumps the session's updated time.
+func (s *Store) AppendMessageSteps(sessionID, role, text, steps string, at time.Time) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`INSERT INTO messages(session_id, role, text, created_at) VALUES(?,?,?,?)`,
-		sessionID, role, text, ms(at)); err != nil {
+	if _, err := tx.Exec(`INSERT INTO messages(session_id, role, text, steps, created_at) VALUES(?,?,?,?,?)`,
+		sessionID, role, text, steps, ms(at)); err != nil {
 		_ = tx.Rollback()
 		return err
 	}
@@ -341,7 +374,7 @@ func (s *Store) AppendMessage(sessionID, role, text string, at time.Time) error 
 
 // Messages returns a session's messages in the order they were written.
 func (s *Store) Messages(sessionID string) ([]Message, error) {
-	rows, err := s.db.Query(`SELECT role, text, created_at FROM messages WHERE session_id = ? ORDER BY id`, sessionID)
+	rows, err := s.db.Query(`SELECT role, text, steps, created_at FROM messages WHERE session_id = ? ORDER BY id`, sessionID)
 	if err != nil {
 		return nil, err
 	}
@@ -350,7 +383,7 @@ func (s *Store) Messages(sessionID string) ([]Message, error) {
 	for rows.Next() {
 		var m Message
 		var at int64
-		if err := rows.Scan(&m.Role, &m.Text, &at); err != nil {
+		if err := rows.Scan(&m.Role, &m.Text, &m.Steps, &at); err != nil {
 			return nil, err
 		}
 		m.At = fromMS(at)
@@ -376,7 +409,6 @@ func (s *Store) SetSetting(key, value string) error {
 
 // UpdateSessionTokens saves the token count for a session.
 func (s *Store) UpdateSessionTokens(id string, tokens int) error {
-_, err := s.db.Exec(`UPDATE sessions SET tokens = ? WHERE id = ?`, tokens, id)
-return err
+	_, err := s.db.Exec(`UPDATE sessions SET tokens = ? WHERE id = ?`, tokens, id)
+	return err
 }
-

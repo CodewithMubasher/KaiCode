@@ -382,14 +382,13 @@ func (c ChatModel) RunShell(cmd, output string) ChatModel {
 }
 
 // EditFile adds a finished file step to the timeline: the full content of a
-// created file, or the diff of an edit. A created file starts collapsed (its
-// heading only) once the tool call is done, so a long file does not push the
-// conversation off screen; clicking the heading opens it. An edit's diff is
-// short and stays open.
+// created file, or the diff of an edit. The node always starts collapsed (its
+// heading only): a file or a diff can be long, and the conversation must stay
+// readable. Clicking the heading opens it.
 func (c ChatModel) EditFile(path string, create bool, diff []DiffLine) ChatModel {
 	c.closeThought()
 	c = c.dropTransient()
-	c.live.steps = append(c.live.steps, liveStep{kind: StepEdit, path: path, diff: diff, create: create, hidden: create})
+	c.live.steps = append(c.live.steps, liveStep{kind: StepEdit, path: path, diff: diff, create: create, hidden: true})
 	c.live.stepVer = nextVer()
 	return c
 }

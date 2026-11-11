@@ -35,7 +35,7 @@ func parseInline(s string, base lipgloss.Style) []span {
 		case s[i] == '`':
 			if j := strings.IndexByte(s[i+1:], '`'); j > 0 {
 				flush()
-				out = append(out, span{s[i+1 : i+1+j], lipgloss.NewStyle().Foreground(ColTeal)})
+				out = append(out, span{s[i+1 : i+1+j], mdInlineCode})
 				i += j + 2
 				continue
 			}
@@ -92,8 +92,9 @@ func wrapSpans(spans []span, first, rest string, w int) []string {
 }
 
 var (
-	mdHeading = lipgloss.NewStyle().Foreground(ColAccent).Bold(true)
-	mdCode    = lipgloss.NewStyle().Foreground(ColMuted).Background(ColPanel)
+	mdHeading    = lipgloss.NewStyle().Foreground(ColAccent).Bold(true)
+	mdCode       = lipgloss.NewStyle().Foreground(ColMuted).Background(ColPanel)
+	mdInlineCode = lipgloss.NewStyle().Foreground(ColTeal).Background(ColPanel)
 )
 
 // mdState is what carries over from one markdown line to the next. Rendering
@@ -105,6 +106,22 @@ type mdState struct {
 }
 
 func newMdState() mdState { return mdState{prevBlank: true} }
+
+// codePill draws one line of a fenced code block as a compact pill: the
+// background covers the command itself, not the whole row. A full-width ribbon
+// makes a one-line command such as "python3 main.py" look like a heading.
+func codePill(line string, w int) string {
+	line = strings.ReplaceAll(line, "\t", "    ")
+	line = strings.TrimRight(line, " ")
+	if line == "" {
+		return ""
+	}
+	s := " " + line + " "
+	if lipgloss.Width(s) > w {
+		s = ansi.Truncate(s, w, "")
+	}
+	return mdCode.Render(s)
+}
 
 // renderMarkdown renders a small markdown subset (headings, bullets,
 // numbered lists, **bold**, `code`, fenced code) as lines at most w wide.
@@ -135,7 +152,7 @@ func renderMarkdownState(text string, w int, st mdState) ([]string, mdState) {
 			continue
 		}
 		if inCode {
-			out = append(out, mdCode.Render(padRight(ansi.Truncate("  "+line, w, ""), w)))
+			out = append(out, codePill(line, w))
 			prevBlank = false
 			continue
 		}

@@ -99,8 +99,9 @@ func (h *providerHub) site(site string) harness.Provider {
 }
 
 // build returns the backend for a choice. DeepSeek Web, Qwen Web (and the
-// scripted demo) are the DSML path; a custom provider is the native tool-calling path. A
-// Backend holds one or the other, never both.
+// scripted demo) use the text-protocol path; Qwen Web speaks JSON, DeepSeek
+// Web speaks DSML. A custom provider (including the Qwen API preset) is the
+// native tool-calling path. A Backend holds one or the other, never both.
 func (h *providerHub) build(a activeProvider) (harness.Backend, string, error) {
 	switch a.Kind {
 	case "mock":
@@ -193,6 +194,23 @@ func (m Model) openAddProvider() (Model, tea.Cmd) {
 	return m, nil
 }
 
+// openQwenAPI opens the built-in Qwen API preset. It is the native
+// OpenAI-compatible path (DashScope), so Qwen gets real structured tool calls
+// instead of the text protocol Qwen Web needs.
+func (m Model) openQwenAPI() (Model, tea.Cmd) {
+	if m.st == nil {
+		return m.noStorage()
+	}
+	m.form = components.NewForm("Qwen API (native tool calling)", []components.FormField{
+		{Label: "Name", Value: "Qwen API"},
+		{Label: "Base URL", Value: "https://dashscope.aliyuncs.com/compatible-mode/v1"},
+		{Label: "API key", Placeholder: "sk-... from dashscope.console.aliyun.com", Secret: true},
+		{Label: "Model", Value: "qwen-plus", Placeholder: "qwen-plus, qwen-max, qwen3-coder-plus…"},
+	}).SetSize(m.width, m.height).SetNote("DashScope's OpenAI-compatible endpoint: real tools/tool_calls, no text markup.")
+	m.formKind = formAddProvider
+	return m, nil
+}
+
 func (m Model) submitForm() (Model, tea.Cmd) {
 	switch m.formKind {
 	case formAddProvider:
@@ -265,9 +283,12 @@ func (m Model) activate(a activeProvider) (Model, tea.Cmd) {
 		m.state, m.fake = StateIdle, nil
 	}
 	m.run.agent.SetBackend(backend)
-	m.run.tokens = 0
+	// Keep the session's token count: switching provider must not make the
+	// gauge look like a brand-new conversation. The new provider replaces it
+	// with its own real count on the next turn.
 	m.hub.active, m.hub.label = a, label
 	m.ps.setProvider(label)
+	m = m.saveState()
 	if m.st != nil {
 		if err := m.st.SetSetting(settingActive, a.String()); err != nil {
 			slog.Warn("could not remember the provider", "err", err)
@@ -281,6 +302,7 @@ func (m Model) openProviderPicker() (Model, tea.Cmd) {
 	items := []components.DialogItem{
 		{Group: "Built-in", Title: "DeepSeek Web (Chrome extension)", Key: activeKey(m.hub.active.Kind == "web"), ID: "use:web"},
 		{Group: "Built-in", Title: "Qwen Web (Chrome extension)", Key: activeKey(m.hub.active.Kind == "qwen"), ID: "use:qwen"},
+		{Group: "Built-in", Title: "Qwen API (native tool calling)…", ID: "qwenapi"},
 	}
 	custom := 0
 	if m.st != nil {
@@ -377,7 +399,7 @@ func (m Model) onModels(msg modelsMsg) (Model, tea.Cmd) {
 		items = append(items, components.DialogItem{Group: "Models", Title: id, Key: key, ID: "m:" + id})
 	}
 	items = append(items, components.DialogItem{Group: "Other", Title: "Type a model name…", ID: "manual"})
-	m.picker = components.NewDialog(items).WithTitle("Model · " + msg.p.Name).SetSize(m.width, m.height).Open()
+	m.picker = components.NewDialog(items).WithTitle("Model · "+msg.p.Name).SetSize(m.width, m.height).Open()
 	m.pickerKind, m.pickerFor = pickerModels, msg.p.ID
 	return m, nil
 }
@@ -421,6 +443,8 @@ func (m Model) pickerChose(it components.DialogItem) (Model, tea.Cmd) {
 			return m.activate(activeProvider{Kind: "web"})
 		case it.ID == "use:qwen":
 			return m.activate(activeProvider{Kind: "qwen"})
+		case it.ID == "qwenapi":
+			return m.openQwenAPI()
 		case strings.HasPrefix(it.ID, "use:"):
 			id, err := strconv.ParseInt(strings.TrimPrefix(it.ID, "use:"), 10, 64)
 			if err == nil {

@@ -95,7 +95,61 @@ func asString(v json.RawMessage) (string, bool) {
 	return s, true
 }
 
+// usageFrom reads a token count the web chat reports. DeepSeek names it
+// "response/accumulated_token_usage"; the field is handled generically so a
+// rename or a Qwen-style usage object still gives the real number.
+func usageFrom(path string, v json.RawMessage) (harness.Usage, bool) {
+	low := strings.ToLower(path)
+	if !strings.Contains(low, "token") && !strings.Contains(low, "usage") {
+		return harness.Usage{}, false
+	}
+	// A bare number is only a total when its field says so. A leaf such as
+	// response/usage/prompt_tokens is one part of the count, not the count.
+	total := strings.Contains(low, "accumulated") || strings.Contains(low, "total") ||
+		strings.HasSuffix(low, "usage") || strings.HasSuffix(low, "token_usage")
+	if total {
+		var n int
+		if json.Unmarshal(v, &n) == nil && n > 0 {
+			return harness.Usage{TotalTokens: n}, true
+		}
+		var s string
+		if json.Unmarshal(v, &s) == nil {
+			if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n > 0 {
+				return harness.Usage{TotalTokens: n}, true
+			}
+		}
+	}
+	var o struct {
+		Total       int `json:"total_tokens"`
+		Accumulated int `json:"accumulated_token_usage"`
+		Prompt      int `json:"prompt_tokens"`
+		Completion  int `json:"completion_tokens"`
+		Input       int `json:"input_tokens"`
+		Output      int `json:"output_tokens"`
+	}
+	if json.Unmarshal(v, &o) != nil {
+		return harness.Usage{}, false
+	}
+	u := harness.Usage{PromptTokens: o.Prompt, CompletionTokens: o.Completion, TotalTokens: o.Total}
+	if u.PromptTokens == 0 {
+		u.PromptTokens = o.Input
+	}
+	if u.CompletionTokens == 0 {
+		u.CompletionTokens = o.Output
+	}
+	if u.TotalTokens == 0 {
+		u.TotalTokens = o.Accumulated
+	}
+	if u.Total() <= 0 {
+		return harness.Usage{}, false
+	}
+	return u, true
+}
+
 func (d *Decoder) apply(path, op string, v json.RawMessage) []harness.StreamEvent {
+	if u, ok := usageFrom(path, v); ok {
+		return []harness.StreamEvent{{Kind: harness.StreamUsage, Usage: &u}}
+	}
 	switch {
 	case path == "" && op == "":
 		// A bare string continues the previous APPEND.

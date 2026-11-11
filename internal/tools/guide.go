@@ -24,6 +24,8 @@ func SystemGuide() string {
 		"- " + ReadFile{}.Spec().Usage() + ": read a small text file.\n" +
 		"- " + CreateFile{}.Spec().Usage() + ": create a new file, or fully rewrite one, with its complete content.\n" +
 		"- " + EditFile{}.Spec().Usage() + ": change part of an existing file by exact text replacement.\n\n" +
+		"All four tools always exist and are always callable. Never tell the user that a tool is missing. " +
+		"In particular, edit_file is available: to change an existing file, call it with path, old_string and new_string.\n\n" +
 		"How to work:\n" +
 		"- Use the shell tool for everything about the file system and running programs: list files, search text and names (grep, find), " +
 		"delete, move and copy, git, builds and tests. Prefer one short command per call.\n" +

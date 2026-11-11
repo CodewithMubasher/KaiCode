@@ -81,6 +81,19 @@ func (s Spec) Usage() string {
 	return s.Name + "(" + strings.Join(parts, ", ") + ")"
 }
 
+// Manifest lists the tools one per line, with their exact parameter names. It
+// is small enough to repeat in every tool-result message, so a model that has
+// drifted cannot decide a tool (such as edit_file) does not exist.
+func Manifest(specs []Spec) string {
+	var b strings.Builder
+	for _, s := range specs {
+		b.WriteString("- ")
+		b.WriteString(s.Usage())
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
 // ExampleArgs is a valid example of the call's arguments as JSON: every
 // required parameter, filled with its Example value.
 func (s Spec) ExampleArgs() string {
@@ -305,7 +318,7 @@ func normalizeArgs(spec Spec, in map[string]any) (map[string]any, string) {
 		if p.Type == "" || p.Type == "string" {
 			switch x := v.(type) {
 			case string:
-			case float64, bool:
+			case int, int64, float64, bool:
 				args[p.Name] = fmt.Sprint(x)
 			case []any:
 				parts := make([]string, 0, len(x))

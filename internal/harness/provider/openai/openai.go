@@ -176,6 +176,10 @@ func (p *Provider) Chat(ctx context.Context, req harness.ChatRequest) (<-chan ha
 		"model":    p.cfg.Model,
 		"messages": p.wireMessages(req.Messages),
 		"stream":   true,
+		// Ask for the final usage chunk. It is what makes the context gauge
+		// show the provider's real token count instead of an estimate. Servers
+		// that do not know the option simply ignore it.
+		"stream_options": map[string]any{"include_usage": true},
 	}
 	if len(req.Tools) > 0 {
 		payload["tools"] = wireTools(req.Tools)
@@ -252,9 +256,37 @@ type chunk struct {
 		} `json:"delta"`
 		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
+	Usage *usageWire `json:"usage"`
 	Error *struct {
 		Message string `json:"message"`
 	} `json:"error"`
+}
+
+// usageWire is the usage object an OpenAI-compatible endpoint returns. Some
+// servers name the fields input_tokens / output_tokens instead.
+type usageWire struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+	InputTokens      int `json:"input_tokens"`
+	OutputTokens     int `json:"output_tokens"`
+}
+
+func (u usageWire) usage() (harness.Usage, bool) {
+	p, c, t := u.PromptTokens, u.CompletionTokens, u.TotalTokens
+	if p == 0 {
+		p = u.InputTokens
+	}
+	if c == 0 {
+		c = u.OutputTokens
+	}
+	if t == 0 {
+		t = p + c
+	}
+	if t <= 0 {
+		return harness.Usage{}, false
+	}
+	return harness.Usage{PromptTokens: p, CompletionTokens: c, TotalTokens: t}, true
 }
 
 // callAcc collects one tool call from its streamed fragments.
@@ -374,6 +406,16 @@ func (p *Provider) stream(ctx, reqCtx context.Context, cancel context.CancelFunc
 					}
 					if choice.FinishReason != nil && *choice.FinishReason != "" {
 						finish = *choice.FinishReason
+					}
+				}
+				// The final chunk carries the endpoint's own token count. It
+				// has no choices, so it is read after them.
+				if c.Usage != nil {
+					if u, ok := c.Usage.usage(); ok {
+						u := u
+						if !send(harness.StreamEvent{Kind: harness.StreamUsage, Usage: &u}) {
+							return
+						}
 					}
 				}
 			}

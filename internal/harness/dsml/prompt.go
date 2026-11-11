@@ -23,6 +23,7 @@ Rules:
 - Write nothing after </|DSML|tool_calls>. Stop and wait: the results arrive in the next message, each inside <tool_result> tags, in the same order as your calls.
 - Copy the tags exactly as shown: ASCII "|" bars, one on each side of DSML, and the wrapper name tool_calls.
 - Only use the tools and parameters defined below.
+- shell, read_file, create_file and edit_file are ALWAYS available. Never tell the user that a tool is missing or unavailable, and never invent extra tools.
 - When the task is finished, reply normally without a tool_calls block.
 - A result that starts with "Error:" means the call FAILED. Read the message (it shows the correct usage), fix the call, and never send the same call again unchanged.
 - Every required parameter must be present in every call, spelled exactly as defined below.
@@ -124,4 +125,15 @@ func RepairPrompt(reason string) string {
 		"<|DSML|tool_calls>\n<|DSML|invoke name=\"TOOL\">\n" +
 		"<|DSML|parameter name=\"PARAM\" string=\"true\">VALUE</|DSML|parameter>\n" +
 		"</|DSML|invoke>\n</|DSML|tool_calls>"
+}
+
+// ResultsPrompt is EncodeResults plus a compact reminder of every tool, so a
+// long web-chat session cannot convince the model that a tool such as
+// edit_file is missing.
+func ResultsPrompt(rs []tools.Result, specs []tools.Spec) string {
+	msg := EncodeResults(rs)
+	if len(specs) == 0 {
+		return msg
+	}
+	return msg + "\n\nThese tools are always available; never say one is missing:\n" + tools.Manifest(specs)
 }

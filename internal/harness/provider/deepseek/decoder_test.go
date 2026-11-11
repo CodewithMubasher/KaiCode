@@ -2,6 +2,7 @@ package deepseek
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"strings"
 	"testing"
@@ -111,6 +112,40 @@ func TestDecodeStreamCutShort(t *testing.T) {
 }
 
 // A follow-up turn in an existing chat (search_enabled, no title event).
+// The real capture reports its running total as accumulated_token_usage.
+func TestDecodeReportsRealUsage(t *testing.T) {
+	f, err := os.Open("testdata/continue.sse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	evs := collect(t, Decode(context.Background(), f))
+	var got *harness.Usage
+	for _, e := range evs {
+		if e.Kind == harness.StreamUsage && e.Usage != nil {
+			u := *e.Usage
+			got = &u
+		}
+	}
+	if got == nil || got.Total() != 90 {
+		t.Fatalf("usage = %+v, want the capture's real total of 90", got)
+	}
+}
+
+// A single counter leaf is not the total: only the accumulated field is.
+func TestUsageLeafIsNotMistakenForTotal(t *testing.T) {
+	d := NewDecoder()
+	evs := d.apply("response/usage/prompt_tokens", "SET", json.RawMessage("500"))
+	if len(evs) != 0 {
+		t.Fatalf("a per-field counter must not become a total: %+v", evs)
+	}
+	evs = d.apply("response/usage", "SET", json.RawMessage(`{"prompt_tokens":500,"completion_tokens":20}`))
+	if len(evs) != 1 || evs[0].Kind != harness.StreamUsage || evs[0].Usage.Total() != 520 {
+		t.Fatalf("usage object = %+v", evs)
+	}
+}
+
 func TestDecodeSecondCapture(t *testing.T) {
 	f, err := os.Open("testdata/continue.sse")
 	if err != nil {

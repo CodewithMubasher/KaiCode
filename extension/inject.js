@@ -4,7 +4,7 @@
 // The page itself sees the response untouched: it still does the
 // proof-of-work, the headers and the cookies.
 (() => {
-  const VERSION = 4;
+  const VERSION = 5;
   const SITE_NAME = location.hostname.includes('qwen') ? 'Qwen' : 'DeepSeek';
   // A newer copy of this script (after an extension update) takes over; the
   // older one goes quiet instead of capturing everything twice.
@@ -38,9 +38,9 @@
       armTimer = setTimeout(() => {
         if (armedId === m.id) {
           armedId = null;
-          log('warn', `armed ${m.id} expired after 90s: the page never made a completion request`);
+          log('warn', `armed ${m.id} expired after 180s: the page never made a completion request`);
         }
-      }, 90000);
+      }, 180000);
       log('info', `armed for ${m.id}`);
     } else if (m.type === 'disarm') {
       armedId = null;

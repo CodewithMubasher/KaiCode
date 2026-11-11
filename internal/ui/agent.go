@@ -286,6 +286,7 @@ func (m Model) applyEvent(ev harness.Event) Model {
 		m.chat = m.chat.EndWrite()
 		m.chat = m.chat.EndAnswer()
 		m = m.saveTokens(true)
+		m = m.saveState()
 
 	case harness.EvError:
 		m = m.endThinking()
@@ -298,6 +299,7 @@ func (m Model) applyEvent(ev harness.Event) Model {
 			msg += "  (log: " + m.cfg.Log.File + ")"
 		}
 		m.chat = m.chat.Fail(msg)
+		m = m.saveState()
 	}
 	return m
 }

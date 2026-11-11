@@ -58,11 +58,12 @@ const (
 	maxLogBody      = 1 << 20
 
 	// Each stage of a send has its own deadline, so a failure says where it
-	// got stuck.
-	acceptTimeout     = 15 * time.Second // extension must pick the command up
-	sentTimeout       = 75 * time.Second // extension must get the prompt into the chat
-	firstChunkTimeout = 90 * time.Second // DeepSeek must start streaming
-	idleTimeout       = 120 * time.Second
+	// got stuck. Qwen can take a while to finish a previous answer, enable its
+	// send button and start the request, so the send stage is generous.
+	acceptTimeout     = 15 * time.Second  // extension must pick the command up
+	sentTimeout       = 180 * time.Second // extension must get the prompt into the chat
+	firstChunkTimeout = 120 * time.Second // the chat must start streaming
+	idleTimeout       = 150 * time.Second
 
 	// ClientHeader is sent by the extension on every request. A web page cannot
 	// add it to a cross-origin request without a preflight, which this server
@@ -404,6 +405,16 @@ type siteProvider struct {
 
 func (p siteProvider) Send(ctx context.Context, t harness.Turn) (<-chan harness.StreamEvent, error) {
 	return p.s.send(ctx, t, p.site)
+}
+
+// ToolProtocol selects the text format the chat is taught. Qwen Web cannot
+// emit native API tool_calls through the page, so it uses the strict JSON
+// protocol; DeepSeek Web keeps its DSML markup.
+func (p siteProvider) ToolProtocol() harness.ToolProtocol {
+	if p.site == SiteQwen {
+		return harness.ProtocolJSON
+	}
+	return harness.ProtocolDSML
 }
 
 // send asks the extension to send t.Prompt in the site's chat and returns the

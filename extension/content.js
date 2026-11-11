@@ -165,7 +165,18 @@
 
     window.postMessage({ kai: true, from: 'content', type: 'arm', id }, '*');
     await typePrompt(input, prompt);
-    if (QWEN) input = await readyToSend(input, prompt);
+
+    // Qwen is much more reliable with its send button than with Enter: the
+    // button stays disabled while a reply is still being written, while Enter
+    // silently does nothing in that state. Click first, retry with a fresh
+    // element if the page replaced the box or dropped the text.
+    if (QWEN) {
+      if (await sendQwen(id, input, prompt)) return { ok: true };
+      window.postMessage({ kai: true, from: 'content', type: 'disarm' }, '*');
+      log('error', `Qwen never sent the message (textarea chars: ${(input.value || '').length})`);
+      return { ok: false, error: 'the page did not send the message (see logs.txt for what the page did)' };
+    }
+
     const started = waitForStart(id, 12000);
     await pressEnter(input);
 
@@ -181,7 +192,7 @@
       if (await retry) return { ok: true };
     } else {
       // The page took the text, so the request is probably still being prepared
-      // (DeepSeek's proof-of-work, Qwen creating the chat). Give it more time.
+      // (DeepSeek's proof-of-work). Give it more time.
       if (await waitForStart(id, 25000)) return { ok: true };
     }
 
@@ -190,24 +201,77 @@
     return { ok: false, error: 'the page did not send the message (see logs.txt for what the page did)' };
   }
 
+  // sendQwen waits for the page to go idle, makes sure the box holds the
+  // prompt, then clicks the send button. If no request starts it retries with
+  // a fresh input element, because Qwen replaces the textarea when the chat
+  // address changes.
+  async function sendQwen(id, input, prompt) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await waitIdle(attempt === 0 ? 20000 : 8000);
+      input = await readyToSend(input, prompt, attempt === 0 ? 25000 : 8000);
+
+      const started = waitForStart(id, 12000);
+      const clicked = await clickSend(input);
+      if (!clicked) {
+        log('warn', 'Qwen has no enabled send button: pressing Enter');
+        await pressEnter(input);
+      }
+      if (await started) {
+        log('info', `Qwen started the request (attempt ${attempt + 1})`);
+        return true;
+      }
+
+      log('warn', `Qwen did not start the request (attempt ${attempt + 1}/3, box has ${(input.value || '').length} of ${prompt.length} chars)`);
+      await waitIdle(5000);
+      const fresh = (await waitFor(findInput, 8000)) || input;
+      input = fresh;
+      if ((input.value || '').length !== prompt.length) await typePrompt(input, prompt);
+    }
+    return false;
+  }
+
+  // Qwen disables sending while a reply is still being written and exposes a
+  // stop button during that time. Only a visible, enabled control counts: the
+  // page may keep hidden buttons in the DOM.
+  function shown(el) {
+    if (!el || el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
+    if (el.offsetParent === null && getComputedStyle(el).position !== 'fixed') return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  }
+
+  function pageBusy() {
+    if (!QWEN) return false;
+    const buttons = [...document.querySelectorAll('button, [role="button"]')].filter(shown);
+    return buttons.some((b) => {
+      const label = ((b.getAttribute('aria-label') || '') + ' ' + (b.title || '') + ' ' + (b.className || '')).toLowerCase();
+      return /stop|停止/.test(label);
+    });
+  }
+
+  async function waitIdle(ms) {
+    return !!(await waitFor(() => !pageBusy(), ms));
+  }
+
   // Qwen's send button is enabled only when the box has text AND the page is
   // idle (it is something else while a reply is still being written, and Enter
   // does nothing then). Typing a tool result right after a reply ends used to
   // leave the text sitting in the box. So wait for the button, and type again
   // if the page cleared the box meanwhile (it moves to the chat's own address
   // a moment after the reply).
-  async function readyToSend(input, prompt) {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const btn = await waitFor(() => findSendButton(input), attempt === 0 ? 30000 : 10000);
+  async function readyToSend(input, prompt, waitMs) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const btn = await waitFor(() => findSendButton(input), waitMs);
+      const box = (await waitFor(findInput, 3000)) || input;
+      input = box;
       const have = (input.value || '').length;
       if (btn && have === prompt.length) {
         if (attempt > 0) log('info', 'the send button is ready');
         return input;
       }
       log('warn', `Qwen is not ready to send (button ${btn ? 'enabled' : 'disabled'}, box has ${have} of ${prompt.length} chars): typing again`);
-      const fresh = (await waitFor(findInput, 10000)) || input;
-      input = fresh;
       await typePrompt(input, prompt);
+      waitMs = 8000;
     }
     log('warn', 'Qwen never showed an enabled send button: trying Enter anyway');
     return input;
@@ -274,11 +338,15 @@
   // The send button is an icon-only button near the input.
   function findSendButton(input) {
     if (QWEN) {
-      // <button class="send-button" aria-label="Send">; it is disabled while the box is empty.
-      const b = [...document.querySelectorAll('button.send-button, button[aria-label="Send"]')].find(
-        (x) => !x.disabled && !x.classList.contains('disabled')
-      );
-      if (b) return b;
+      // <button class="send-button" aria-label="Send">; the same element turns
+      // into a stop button while a reply is being written, so exclude those.
+      const all = [...document.querySelectorAll('button, [role="button"]')].filter(shown);
+      const send = all.find((b) => {
+        const label = ((b.getAttribute('aria-label') || '') + ' ' + (b.title || '') + ' ' + (b.className || '')).toLowerCase();
+        if (/stop|停止/.test(label)) return false;
+        return b.classList.contains('send-button') || /send|发送/.test(label);
+      });
+      if (send) return send;
     }
     let box = input;
     for (let i = 0; i < 5 && box.parentElement; i++) box = box.parentElement;

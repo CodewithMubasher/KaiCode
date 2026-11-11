@@ -35,7 +35,27 @@ const (
 	StreamSent                           // the prompt reached the web chat (the chat now exists)
 	StreamToolProgress                   // a tool call is still being written; Tool says which
 	StreamToolCall                       // a complete native tool call (native providers only); ToolCall holds it
+	StreamUsage                          // the provider reported its real token usage (Usage)
 )
+
+// Usage is the token usage a provider reports for one request. It is the
+// provider's own count, not an estimate: prompt tokens are everything the
+// model read (instructions, history and tool definitions included) and
+// completion tokens are everything it wrote.
+type Usage struct {
+	PromptTokens     int
+	CompletionTokens int
+	TotalTokens      int
+}
+
+// Total returns the count to show for the context: the total when the provider
+// gives one, otherwise prompt plus completion.
+func (u Usage) Total() int {
+	if u.TotalTokens > 0 {
+		return u.TotalTokens
+	}
+	return u.PromptTokens + u.CompletionTokens
+}
 
 // ToolProgress is a tool call as it is being written: the model has sent the
 // invoke and part of its arguments but not the whole block yet.
@@ -53,6 +73,7 @@ type StreamEvent struct {
 	MessageID int
 	Tool      *ToolProgress // StreamToolProgress
 	ToolCall  *ToolCall     // StreamToolCall
+	Usage     *Usage        // StreamUsage
 	Err       error
 }
 

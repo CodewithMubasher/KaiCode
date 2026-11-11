@@ -117,6 +117,34 @@ func (a *Agent) History() []Entry {
 	return append([]Entry(nil), a.history...)
 }
 
+// Snapshot is the agent state that cannot be rebuilt from the message log.
+// The native path is stateless, so its full conversation (tool calls and
+// results included) must be saved to continue it after a restart; the token
+// count is the provider's last real count.
+type Snapshot struct {
+	Tokens int           `json:"tokens,omitempty"`
+	Native []ChatMessage `json:"native,omitempty"`
+}
+
+// Snapshot returns the current agent state for storage.
+func (a *Agent) Snapshot() Snapshot {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return Snapshot{Tokens: a.tokens, Native: cloneMessages(a.msgs)}
+}
+
+func cloneMessages(in []ChatMessage) []ChatMessage {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]ChatMessage, len(in))
+	copy(out, in)
+	for i := range out {
+		out[i].ToolCalls = append([]ToolCall(nil), in[i].ToolCalls...)
+	}
+	return out
+}
+
 func (a *Agent) record(role, text, steps string) {
 	e := Entry{Role: role, Text: text, Steps: steps, At: time.Now()}
 	a.mu.Lock()
@@ -259,6 +287,24 @@ func (a *Agent) Resume(h []Entry) {
 	if s, ok := a.provider().(Sessioner); ok {
 		_ = s.NewSession(context.Background())
 	}
+}
+
+// ResumeWithState loads a saved conversation and the state saved with it. On
+// the native path the full conversation is restored and sent as it was, so
+// the model keeps its context exactly; on the web path the browser chat is
+// gone, so the recap is still used, but the saved token count is kept.
+func (a *Agent) ResumeWithState(h []Entry, s Snapshot) {
+	a.Resume(h)
+	a.mu.Lock()
+	if s.Tokens > 0 {
+		a.tokens = s.Tokens
+	}
+	if a.cfg.Native != nil && len(s.Native) > 0 {
+		a.msgs = cloneMessages(s.Native)
+		a.recap = ""
+		a.started = true
+	}
+	a.mu.Unlock()
 }
 
 // nativeProvider is the native provider in use, or nil on the DSML path.

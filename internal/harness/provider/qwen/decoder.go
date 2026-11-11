@@ -40,9 +40,37 @@ type chunk struct {
 	Choices []struct {
 		Delta delta `json:"delta"`
 	} `json:"choices"`
+	Usage   *usageWire      `json:"usage"`
 	Error   json.RawMessage `json:"error"`
 	Success *bool           `json:"success"`
 	Data    json.RawMessage `json:"data"`
+}
+
+// usageWire is the token usage Qwen reports with a reply. It is the real
+// count from the provider, not an estimate.
+type usageWire struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+	InputTokens      int `json:"input_tokens"`
+	OutputTokens     int `json:"output_tokens"`
+}
+
+func (u usageWire) usage() (harness.Usage, bool) {
+	p, c, t := u.PromptTokens, u.CompletionTokens, u.TotalTokens
+	if p == 0 {
+		p = u.InputTokens
+	}
+	if c == 0 {
+		c = u.OutputTokens
+	}
+	if t == 0 {
+		t = p + c
+	}
+	if t <= 0 {
+		return harness.Usage{}, false
+	}
+	return harness.Usage{PromptTokens: p, CompletionTokens: c, TotalTokens: t}, true
 }
 
 // Decoder holds the state of one reply.
@@ -70,8 +98,14 @@ func (d *Decoder) Handle(data string) []harness.StreamEvent {
 		d.ended = true
 		return []harness.StreamEvent{{Kind: harness.StreamError, Err: errors.New("qwen error: " + msg)}}
 	}
+	var out []harness.StreamEvent
+	if c.Usage != nil {
+		if u, ok := c.Usage.usage(); ok {
+			out = append(out, harness.StreamEvent{Kind: harness.StreamUsage, Usage: &u})
+		}
+	}
 	if len(c.Choices) == 0 {
-		return nil // response.created, usage-only chunks, ...
+		return out // response.created, usage-only chunks, ...
 	}
 	dl := c.Choices[0].Delta
 	phase := strings.ToLower(dl.Phase)
@@ -81,7 +115,6 @@ func (d *Decoder) Handle(data string) []harness.StreamEvent {
 		_ = json.Unmarshal(dl.Content, &s) // not a string (a structured summary): ignore
 	}
 
-	var out []harness.StreamEvent
 	switch {
 	case phase == "" || phase == "answer":
 		if s != "" {

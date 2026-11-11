@@ -322,9 +322,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m = m.stopRun()
 				m.chat = m.chat.Stop()
 				m.state, m.fake = StateIdle, nil
+				m = m.saveState()
 				return m.layout(), nil
 			}
 			if m.input.Value() == "" {
+				m = m.saveState()
 				return m, tea.Quit
 			}
 			m.input = m.input.Reset()
@@ -430,4 +432,12 @@ func (m Model) View() tea.View {
 	v.BackgroundColor = components.ColBG
 	v.MouseMode = tea.MouseModeAllMotion
 	return v
+}
+
+// Shutdown saves the open session one last time after the TUI has stopped.
+// The chat and the provider's token count are written to the database, so the
+// next start shows the same timeline.
+func (m Model) Shutdown() {
+	m = m.stopRun()
+	m = m.saveState()
 }

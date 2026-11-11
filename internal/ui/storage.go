@@ -3,6 +3,7 @@ package ui
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -11,6 +12,7 @@ import (
 
 	"kai/internal/harness"
 	"kai/internal/store"
+	"kai/internal/ui/components"
 )
 
 type persister struct {
@@ -100,8 +102,66 @@ func (p *persister) record(e harness.Entry) {
 			slog.Warn("could not create the session", "err", err)
 		}
 	}
-	// Save the full entry including steps
-	if err := p.st.AppendMessage(p.id, e.Role, e.Text, e.At); err != nil {
+	// Save the full entry including steps when the caller has them.
+	if err := p.st.AppendMessageSteps(p.id, e.Role, e.Text, e.Steps, e.At); err != nil {
 		slog.Warn("could not save a message", "session", p.id, "err", err)
 	}
+}
+
+// sessionState is everything needed to reopen a session exactly as it was:
+// the rendered chat (timeline nodes included), the agent's native
+// conversation, and the provider's real token count.
+type sessionState struct {
+	Messages []components.Message `json:"messages,omitempty"`
+	Tokens   int                  `json:"tokens,omitempty"`
+	Agent    harness.Snapshot     `json:"agent,omitempty"`
+}
+
+// saveState writes the current chat and agent state to the session. It is
+// called when a run ends and when the session is switched or Kai exits, so a
+// timeline never disappears between visits.
+func (m Model) saveState() Model {
+	if m.st == nil || m.ps == nil {
+		return m
+	}
+	id := m.ps.current()
+	if id == "" {
+		return m // no message has been saved yet: nothing to attach it to
+	}
+	state := sessionState{
+		Messages: m.chat.Snapshot(),
+		Tokens:   m.run.tokens,
+	}
+	if a := m.agent(); a != nil {
+		state.Agent = a.Snapshot()
+	}
+	b, err := json.Marshal(state)
+	if err != nil {
+		slog.Warn("could not encode the session state", "session", id, "err", err)
+		return m
+	}
+	if err := m.st.SaveSessionState(id, string(b), m.run.tokens); err != nil {
+		slog.Warn("could not save the session state", "session", id, "err", err)
+		return m
+	}
+	m.run.savedTokens, m.run.savedAt = m.run.tokens, time.Now()
+	return m
+}
+
+// loadSessionState reads a saved session state. ok is false when the session
+// predates state saving or when the blob is unreadable.
+func loadSessionState(st *store.Store, id string) (sessionState, bool) {
+	if st == nil || id == "" {
+		return sessionState{}, false
+	}
+	raw, err := st.SessionState(id)
+	if err != nil || strings.TrimSpace(raw) == "" {
+		return sessionState{}, false
+	}
+	var state sessionState
+	if err := json.Unmarshal([]byte(raw), &state); err != nil {
+		slog.Warn("could not read the session state", "session", id, "err", err)
+		return sessionState{}, false
+	}
+	return state, true
 }

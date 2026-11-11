@@ -24,5 +24,6 @@ type Event struct {
 	Result   *tools.Result
 	Progress *ToolProgress
 	Tokens   int
+	Exact    bool // EvUsage: Tokens is the provider's own count, not an estimate
 	Err      error
 }
