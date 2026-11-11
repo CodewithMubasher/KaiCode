@@ -16,14 +16,37 @@ import (
 
 	"kai/internal/harness"
 	"kai/internal/harness/provider/deepseek"
+	"kai/internal/harness/provider/qwen"
 )
+
+// The web chats Kai can drive. The extension opens the matching site; the
+// reply stream is decoded by the matching decoder.
+const (
+	SiteDeepSeek = "deepseek"
+	SiteQwen     = "qwen"
+)
+
+// siteHost is the address the person sees in messages about a site.
+func siteHost(site string) string {
+	if site == SiteQwen {
+		return "chat.qwen.ai"
+	}
+	return "chat.deepseek.com"
+}
+
+func decoderFor(site string) func(context.Context, io.Reader) <-chan harness.StreamEvent {
+	if site == SiteQwen {
+		return qwen.Decode
+	}
+	return deepseek.Decode
+}
 
 var (
 	// ErrNotConnected is returned when no extension is polling.
-	ErrNotConnected = errors.New("the Kai Bridge extension is not connected: install it in Chrome (chrome://extensions, Load unpacked), open chat.deepseek.com and log in. Details are in logs.txt")
+	ErrNotConnected = errors.New("the Kai Bridge extension is not connected: install it in Chrome (chrome://extensions, Load unpacked), open chat.deepseek.com or chat.qwen.ai and log in. Details are in logs.txt")
 
 	errNotPickedUp = errors.New("the extension never picked up the message: is the Kai Bridge extension enabled? Details are in logs.txt")
-	errNotSent     = errors.New("the extension got the message but could not send it in chat.deepseek.com: is the tab logged in? Details are in logs.txt")
+	errNotSent     = errors.New("the extension got the message but could not send it in the chat tab: is it logged in? Details are in logs.txt")
 	errNoReply     = errors.New("the message was sent in the browser but no reply reached Kai: open the extension popup, run Self-test, and check logs.txt")
 	errStalled     = errors.New("the reply stalled: no data for two minutes")
 )
@@ -61,6 +84,7 @@ type Command struct {
 	Prompt  string `json:"prompt,omitempty"`
 	Session string `json:"session,omitempty"` // one Kai session = one web chat
 	NewChat bool   `json:"newChat,omitempty"` // first message of the session: open a fresh chat
+	Site    string `json:"site,omitempty"`    // "deepseek" (default) or "qwen": which web chat to use
 }
 
 // event is what the extension reports back.
@@ -331,7 +355,7 @@ func (s *Server) deliver(ev event) {
 		s.log.Info("extension accepted the message", "id", ev.ID)
 	case "sent":
 		st.markSent()
-		s.log.Info("message delivered to chat.deepseek.com", "id", ev.ID, "after", time.Since(st.began).Round(time.Millisecond))
+		s.log.Info("message delivered to the web chat", "id", ev.ID, "after", time.Since(st.began).Round(time.Millisecond))
 	case "chunk":
 		st.mu.Lock()
 		first := st.chunks == 0
@@ -364,10 +388,28 @@ func (s *Server) deliver(ev event) {
 	}
 }
 
-// Send implements harness.Provider: it asks the extension to send t.Prompt in
-// the DeepSeek chat and returns the decoded reply stream. A Turn with NewChat
-// set opens a fresh web chat; later turns of the same Session continue it.
+// Send implements harness.Provider for DeepSeek Web.
 func (s *Server) Send(ctx context.Context, t harness.Turn) (<-chan harness.StreamEvent, error) {
+	return s.send(ctx, t, SiteDeepSeek)
+}
+
+// ForSite returns a provider that talks to the given web chat through this
+// same bridge: one port and one extension serve every site.
+func (s *Server) ForSite(site string) harness.Provider { return siteProvider{s: s, site: site} }
+
+type siteProvider struct {
+	s    *Server
+	site string
+}
+
+func (p siteProvider) Send(ctx context.Context, t harness.Turn) (<-chan harness.StreamEvent, error) {
+	return p.s.send(ctx, t, p.site)
+}
+
+// send asks the extension to send t.Prompt in the site's chat and returns the
+// decoded reply stream. A Turn with NewChat set opens a fresh web chat; later
+// turns of the same Session continue it.
+func (s *Server) send(ctx context.Context, t harness.Turn, site string) (<-chan harness.StreamEvent, error) {
 	if !s.Connected() {
 		s.log.Warn("send refused: extension not connected")
 		return nil, ErrNotConnected
@@ -393,7 +435,7 @@ func (s *Server) Send(ctx context.Context, t harness.Turn) (<-chan harness.Strea
 	s.streams[id] = st
 	s.mu.Unlock()
 
-	cmd := Command{ID: id, Type: "send", Prompt: t.Prompt, Session: t.Session, NewChat: t.NewChat}
+	cmd := Command{ID: id, Type: "send", Prompt: t.Prompt, Session: t.Session, NewChat: t.NewChat, Site: site}
 	select {
 	case s.cmds <- cmd:
 	default:
@@ -401,7 +443,7 @@ func (s *Server) Send(ctx context.Context, t harness.Turn) (<-chan harness.Strea
 		s.forget(id)
 		return nil, errors.New("the bridge is busy: too many pending commands")
 	}
-	s.log.Info("message queued for the extension", "id", id, "session", t.Session, "newChat", t.NewChat, "promptBytes", len(t.Prompt))
+	s.log.Info("message queued for the extension", "id", id, "site", siteHost(site), "session", t.Session, "newChat", t.NewChat, "promptBytes", len(t.Prompt))
 
 	go func() {
 		select {
@@ -417,7 +459,7 @@ func (s *Server) Send(ctx context.Context, t harness.Turn) (<-chan harness.Strea
 		s.forget(id)
 	}()
 
-	return merge(ctx, st, deepseek.Decode(ctx, pr)), nil
+	return merge(ctx, st, decoderFor(site)(ctx, pr)), nil
 }
 
 // merge puts a StreamSent event in front of the decoded reply as soon as the

@@ -33,7 +33,7 @@ func configPath() string {
 
 var rootCmd = &cobra.Command{
 	Use:   "kai",
-	Short: "Kai Code — DeepSeek WebChat agent harness",
+	Short: "Kai Code — web chat agent harness (DeepSeek, Qwen)",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cfg, err := config.Load(configPath())
 		if err != nil {

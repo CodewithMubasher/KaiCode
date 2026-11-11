@@ -12,6 +12,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
+	"kai/internal/bridge"
 	"kai/internal/config"
 	"kai/internal/harness"
 	"kai/internal/harness/provider/openai"
@@ -20,7 +21,8 @@ import (
 )
 
 // settingActive is the settings key holding the provider in use:
-// "web" (Chrome extension bridge) or "custom:<id>".
+// "web" (DeepSeek Web), "qwen" (Qwen Web; both through the Chrome extension
+// bridge) or "custom:<id>".
 const settingActive = "active_provider"
 
 var errNoModel = errors.New("no model selected")
@@ -47,7 +49,7 @@ const (
 
 // activeProvider says which provider answers.
 type activeProvider struct {
-	Kind string // "web", "mock" or "custom"
+	Kind string // "web" (DeepSeek), "qwen", "mock" or "custom"
 	ID   int64  // custom provider id
 }
 
@@ -64,6 +66,9 @@ func parseActive(s string) activeProvider {
 			return activeProvider{Kind: "custom", ID: id}
 		}
 	}
+	if s == "qwen" {
+		return activeProvider{Kind: "qwen"}
+	}
 	return activeProvider{Kind: "web"}
 }
 
@@ -72,13 +77,29 @@ func parseActive(s string) activeProvider {
 type providerHub struct {
 	cfg    *config.Config
 	st     *store.Store
-	web    harness.Provider
+	srv    *bridge.Server // the Chrome bridge, started the first time a web chat is chosen
+	srvErr error
 	active activeProvider
 	label  string
 }
 
-// build returns the backend for a choice. DeepSeek Web (and the scripted demo)
-// is the DSML path; a custom provider is the native tool-calling path. A
+// site returns the web chat provider for one site, starting the bridge once.
+// DeepSeek and Qwen share the one bridge (one port, one extension).
+func (h *providerHub) site(site string) harness.Provider {
+	if h.srv == nil && h.srvErr == nil {
+		h.srv, h.srvErr = startBridge(h.cfg)
+	}
+	if h.srvErr != nil {
+		return brokenProvider{h.srvErr}
+	}
+	if site == bridge.SiteDeepSeek {
+		return h.srv
+	}
+	return h.srv.ForSite(site)
+}
+
+// build returns the backend for a choice. DeepSeek Web, Qwen Web (and the
+// scripted demo) are the DSML path; a custom provider is the native tool-calling path. A
 // Backend holds one or the other, never both.
 func (h *providerHub) build(a activeProvider) (harness.Backend, string, error) {
 	switch a.Kind {
@@ -97,11 +118,10 @@ func (h *providerHub) build(a activeProvider) (harness.Backend, string, error) {
 		}
 		prov := openai.New(openai.Config{Name: p.Name, BaseURL: p.BaseURL, APIKey: p.APIKey, Model: p.Model})
 		return harness.Backend{Native: prov}, p.Name + " · " + p.Model, nil
+	case "qwen":
+		return harness.Backend{Web: h.site(bridge.SiteQwen)}, "Qwen Web", nil
 	default:
-		if h.web == nil {
-			h.web = startBridge(h.cfg)
-		}
-		return harness.Backend{Web: h.web}, "DeepSeek Web", nil
+		return harness.Backend{Web: h.site(bridge.SiteDeepSeek)}, "DeepSeek Web", nil
 	}
 }
 
@@ -258,9 +278,10 @@ func (m Model) activate(a activeProvider) (Model, tea.Cmd) {
 }
 
 func (m Model) openProviderPicker() (Model, tea.Cmd) {
-	items := []components.DialogItem{{
-		Group: "Built-in", Title: "DeepSeek Web (Chrome extension)", Key: activeKey(m.hub.active.Kind == "web"), ID: "use:web",
-	}}
+	items := []components.DialogItem{
+		{Group: "Built-in", Title: "DeepSeek Web (Chrome extension)", Key: activeKey(m.hub.active.Kind == "web"), ID: "use:web"},
+		{Group: "Built-in", Title: "Qwen Web (Chrome extension)", Key: activeKey(m.hub.active.Kind == "qwen"), ID: "use:qwen"},
+	}
 	custom := 0
 	if m.st != nil {
 		list, err := m.st.Providers()
@@ -317,7 +338,7 @@ func (m Model) openRemovePicker() (Model, tea.Cmd) {
 
 func (m Model) switchModel() (Model, tea.Cmd) {
 	if m.hub.active.Kind != "custom" {
-		return m.setNotice("The DeepSeek Web model is chosen in the browser")
+		return m.setNotice("The web chat's model is chosen in the browser")
 	}
 	return m.chooseModel(m.hub.active.ID)
 }
@@ -398,6 +419,8 @@ func (m Model) pickerChose(it components.DialogItem) (Model, tea.Cmd) {
 			return m.openRemovePicker()
 		case it.ID == "use:web":
 			return m.activate(activeProvider{Kind: "web"})
+		case it.ID == "use:qwen":
+			return m.activate(activeProvider{Kind: "qwen"})
 		case strings.HasPrefix(it.ID, "use:"):
 			id, err := strconv.ParseInt(strings.TrimPrefix(it.ID, "use:"), 10, 64)
 			if err == nil {

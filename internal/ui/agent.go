@@ -90,7 +90,7 @@ func newRunState(cfg *config.Config, ps *persister, hub *providerHub) runState {
 	}
 
 	return runState{agent: harness.New(harness.Config{
-		Provider:     backend.Web,    // DeepSeek Web: DSML
+		Provider:     backend.Web,    // DeepSeek Web / Qwen Web: DSML
 		Native:       backend.Native, // custom OpenAI-compatible: API tool calling
 		Tools:        reg,
 		System:       kaiSystem(),
@@ -100,7 +100,7 @@ func newRunState(cfg *config.Config, ps *persister, hub *providerHub) runState {
 	})}
 }
 
-func startBridge(cfg *config.Config) harness.Provider {
+func startBridge(cfg *config.Config) (*bridge.Server, error) {
 	addr := cfg.Provider.Addr
 	if addr == "" {
 		addr = "127.0.0.1:8765"
@@ -108,9 +108,9 @@ func startBridge(cfg *config.Config) harness.Provider {
 	srv, err := bridge.Start(addr, slog.Default())
 	if err != nil {
 		slog.Error("could not start the bridge", "addr", addr, "err", err)
-		return brokenProvider{fmt.Errorf("could not start the bridge on %s (is another Kai running?): %w", addr, err)}
+		return nil, fmt.Errorf("could not start the bridge on %s (is another Kai running?): %w", addr, err)
 	}
-	return srv
+	return srv, nil
 }
 
 type brokenProvider struct{ err error }
@@ -238,6 +238,10 @@ func (m Model) applyEvent(ev harness.Event) Model {
 			old, _ := tools.StringArg(ev.Call.Args, "old_string")
 			body, _ := tools.StringArg(ev.Call.Args, "new_string")
 			m.chat = m.chat.WriteProgress("edit_file", path, countLines(body), strings.TrimSpace(old) == "")
+		case "create_file":
+			path, _ := tools.StringArg(ev.Call.Args, "path")
+			body, _ := tools.StringArg(ev.Call.Args, "content")
+			m.chat = m.chat.WriteProgress("create_file", path, countLines(body), true)
 		default:
 			// A running line, so a slow command is not a silent gap.
 			m.chat = m.chat.ShellStart(callLabel(*ev.Call))
@@ -253,19 +257,26 @@ func (m Model) applyEvent(ev harness.Event) Model {
 		switch {
 		case ev.Call.Name == "read_file" && !ev.Result.IsError:
 			// Already on screen from its call.
-		case ev.Call.Name == "edit_file" && !ev.Result.IsError:
-			path, _ := tools.StringArg(ev.Call.Args, "path")
-			body, _ := tools.StringArg(ev.Call.Args, "new_string")
-			old, _ := tools.StringArg(ev.Call.Args, "old_string")
-			verb := "Wrote"
-			if strings.TrimSpace(old) == "" {
-				verb = "Created"
+		case ev.Call.Name == "edit_file" || ev.Call.Name == "create_file":
+			// A file step is a timeline node: the full content of a created
+			// file, or the diff of an edit. The tool's own result text (what
+			// the model reads) is never drawn.
+			path, create, diff, _ := editDisplay(*ev.Call, ev.Result)
+			if ev.Result.IsError {
+				m.chat = m.chat.EditFailed(path, create, shortError(ev.Result))
+			} else {
+				m.chat = m.chat.EditFile(path, create, diff)
 			}
-			m.chat = m.chat.RunShell(verb+" "+path, body)
 		default:
 			out := ev.Result.Output
 			if ev.Result.IsError {
-				out = "Error: " + out
+				// A mistake in the call itself (missing parameter, unknown
+				// tool) is guidance for the model: the person gets one line.
+				if s := strings.TrimSpace(ev.Result.Short); s != "" {
+					out = "Error: " + s
+				} else {
+					out = "Error: " + out
+				}
 			}
 			m.chat = m.chat.RunShell(callLabel(*ev.Call), out)
 		}
@@ -310,21 +321,44 @@ func (m Model) endThinking() Model {
 	return m
 }
 
-const maxDiffLines = 60
+// maxNodeLines bounds what one file node draws. A created file is shown in
+// full up to this many lines, then a notice says how many were left out.
+const maxNodeLines = 500
 
 var firstLineRe = regexp.MustCompile(`first at line (\d+)`)
 
+// shortError is the one line the person sees for a failed call.
+func shortError(r *tools.Result) string {
+	if strings.TrimSpace(r.Short) != "" {
+		return r.Short
+	}
+	line := strings.TrimSpace(strings.SplitN(strings.TrimSpace(r.Output), "\n", 2)[0])
+	if line == "" {
+		return "the tool failed"
+	}
+	return line
+}
+
+// editDisplay builds what a file step shows. create_file, and edit_file with
+// an empty old_string, create a file: every line of the content, numbered.
+// An edit shows the removed lines and the added lines with their line numbers.
 func editDisplay(c tools.Call, res *tools.Result) (path string, create bool, diff []components.DiffLine, ok bool) {
 	path, _ = tools.StringArg(c.Args, "path")
 	if strings.TrimSpace(path) == "" {
-		return "", false, nil, false
+		return "", c.Name == "create_file", nil, false
 	}
-	oldS, _ := tools.StringArg(c.Args, "old_string")
-	newS, _ := tools.StringArg(c.Args, "new_string")
-	create = strings.TrimSpace(oldS) == ""
+	var oldS, newS string
+	if c.Name == "create_file" {
+		create = true
+		newS, _ = tools.StringArg(c.Args, "content")
+	} else {
+		oldS, _ = tools.StringArg(c.Args, "old_string")
+		newS, _ = tools.StringArg(c.Args, "new_string")
+		create = strings.TrimSpace(oldS) == ""
+	}
 
 	start := 1
-	if !create {
+	if !create && res != nil {
 		if m := firstLineRe.FindStringSubmatch(res.Output); m != nil {
 			if n, err := strconv.Atoi(m[1]); err == nil && n > 0 {
 				start = n
@@ -335,13 +369,17 @@ func editDisplay(c tools.Call, res *tools.Result) (path string, create bool, dif
 			start++
 		}
 	}
+	kind := components.DiffAdd
+	if create {
+		kind = components.DiffContext // a whole new file is plain numbered text, not a green wall
+	}
 	for _, l := range textLines(newS) {
-		diff = append(diff, components.DiffLine{Kind: components.DiffAdd, Num: start, Text: l})
+		diff = append(diff, components.DiffLine{Kind: kind, Num: start, Text: l})
 		start++
 	}
-	if len(diff) > maxDiffLines {
-		more := len(diff) - maxDiffLines
-		diff = append(diff[:maxDiffLines], components.DiffLine{Text: fmt.Sprintf("… %d more lines", more)})
+	if len(diff) > maxNodeLines {
+		more := len(diff) - maxNodeLines
+		diff = append(diff[:maxNodeLines], components.DiffLine{Text: fmt.Sprintf("… %d more lines", more)})
 	}
 	return path, create, diff, true
 }

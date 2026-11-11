@@ -286,3 +286,35 @@ func TestExtensionLogsLandInTheLog(t *testing.T) {
 		t.Errorf("log = %q", buf.String())
 	}
 }
+
+func TestForSiteSendsTheSiteToTheExtensionAndDecodesItsStream(t *testing.T) {
+	s := NewServer(nil)
+	s.touch()
+	body := "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\",\"phase\":\"answer\",\"status\":\"typing\"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"content\":\"\",\"phase\":\"answer\",\"status\":\"finished\"}}]}\n\n"
+
+	ch, err := s.ForSite(SiteQwen).Send(context.Background(), harness.Turn{Prompt: "x", Session: "s1", NewChat: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := <-s.cmds
+	if cmd.Site != SiteQwen || !cmd.NewChat {
+		t.Fatalf("command = %+v", cmd)
+	}
+	s.deliver(event{ID: cmd.ID, Type: "sent"})
+	s.deliver(event{ID: cmd.ID, Type: "chunk", Data: body})
+	s.deliver(event{ID: cmd.ID, Type: "end"})
+
+	var text string
+	for e := range ch {
+		if e.Kind == harness.StreamText {
+			text += e.Text
+		}
+		if e.Kind == harness.StreamError {
+			t.Fatalf("error: %v", e.Err)
+		}
+	}
+	if text != "Hi" {
+		t.Errorf("text = %q", text)
+	}
+}

@@ -1,0 +1,32 @@
+data: {"response.created":{"chat_id": "b3f253da-1c51-41af-bf6e-0c42494acf3b", "parent_id": "b4255a7f-71ee-4979-9a4b-b8e68ca02442", "response_id":"07dfb812-dd35-49df-914f-b6fe3d8369d4", "response_index": "0"}} 
+
+data: {"choices": [{"delta": {"role": "assistant", "content": "Hello", "phase": "answer", "status": "typing"}}], "response_id": "07dfb812-dd35-49df-914f-b6fe3d8369d4", "usage": {"input_tokens": 981, "output_tokens": 1, "characters": 0, "total_tokens": 982}, "timestamp": 1794306272}
+
+data: {"choices": [{"delta": {"role": "assistant", "content": " M", "phase": "answer", "status": "typing"}}], "response_id": "07dfb812-dd35-49df-914f-b6fe3d8369d4", "usage": {"input_tokens": 981, "output_tokens": 2, "characters": 0, "total_tokens": 983}, "timestamp": 1794306272}
+
+data: {"choices": [{"delta": {"role": "assistant", "content": "ubasher! How", "phase": "answer", "status": "typing"}}], "response_id": "07dfb812-dd35-49df-914f-b6fe3d8369d4", "usage": {"input_tokens": 981, "output_tokens": 6, "characters": 0, "total_tokens": 987}, "timestamp": 1794306272}
+
+data: {"choices": [{"delta": {"role": "assistant", "content": " can I help you", "phase": "answer", "status": "typing"}}], "response_id": "07dfb812-dd35-49df-914f-b6fe3d8369d4", "usage": {"input_tokens": 981, "output_tokens": 10, "characters": 0, "total_tokens": 991}, "timestamp": 1794306272}
+
+data: {"choices": [{"delta": {"role": "assistant", "content": " today? Whether", "phase": "answer", "status": "typing"}}], "response_id": "07dfb812-dd35-49df-914f-b6fe3d8369d4", "usage": {"input_tokens": 981, "output_tokens": 13, "characters": 0, "total_tokens": 994}, "timestamp": 1794306272}
+
+data: {"choices": [{"delta": {"role": "assistant", "content": " it's about full", "phase": "answer", "status": "typing"}}], "response_id": "07dfb812-dd35-49df-914f-b6fe3d8369d4", "usage": {"input_tokens": 981, "output_tokens": 17, "characters": 0, "total_tokens": 998}, "timestamp": 1794306272}
+
+data: {"choices": [{"delta": {"role": "assistant", "content": "-stack development, college", "phase": "answer", "status": "typing"}}], "response_id": "07dfb812-dd35-49df-914f-b6fe3d8369d4", "usage": {"input_tokens": 981, "output_tokens": 21, "characters": 0, "total_tokens": 1002}, "timestamp": 1794306272}
+
+data: {"choices": [{"delta": {"role": "assistant", "content": " studies, or finding", "phase": "answer", "status": "typing"}}], "response_id": "07dfb812-dd35-49df-914f-b6fe3d8369d4", "usage": {"input_tokens": 981, "output_tokens": 25, "characters": 0, "total_tokens": 1006}, "timestamp": 1794306272}
+
+data: {"choices": [{"delta": {"role": "assistant", "content": " resources", "phase": "answer", "status": "typing"}}], "response_id": "07dfb812-dd35-49df-914f-b6fe3d8369d4", "usage": {"input_tokens": 981, "output_tokens": 26, "characters": 0, "total_tokens": 1007}, "timestamp": 1794306272}
+
+data: {"choices": [{"delta": {"role": "assistant", "content": " for self-impro", "phase": "answer", "status": "typing"}}], "response_id": "07dfb812-dd35-49df-914f-b6fe3d8369d4", "usage": {"input_tokens": 981, "output_tokens": 30, "characters": 0, "total_tokens": 1011}, "timestamp": 1794306272}
+
+data: {"choices": [{"delta": {"role": "assistant", "content": "vement, feel", "phase": "answer", "status": "typing"}}], "response_id": "07dfb812-dd35-49df-914f-b6fe3d8369d4", "usage": {"input_tokens": 981, "output_tokens": 33, "characters": 0, "total_tokens": 1014}, "timestamp": 1794306272}
+
+data: {"choices": [{"delta": {"role": "assistant", "content": " free to ask.", "phase": "answer", "status": "typing"}}], "response_id": "07dfb812-dd35-49df-914f-b6fe3d8369d4", "usage": {"input_tokens": 981, "output_tokens": 37, "characters": 0, "total_tokens": 1018}, "timestamp": 1794306272}
+
+data: {"choices": [{"delta": {"role": "assistant", "content": "", "phase": "answer", "status": "typing"}}], "response_id": "07dfb812-dd35-49df-914f-b6fe3d8369d4", "usage": {"input_tokens": 981, "output_tokens": 37, "characters": 0, "total_tokens": 1018}, "timestamp": 1794306272}
+
+data: {"choices": [{"delta": {"role": "assistant", "content": "", "phase": "answer", "status": "typing"}}], "response_id": "07dfb812-dd35-49df-914f-b6fe3d8369d4", "usage": {"input_tokens": 981, "output_tokens": 37, "characters": 0, "total_tokens": 1018}, "timestamp": 1794306272}
+
+data: {"choices": [{"delta": {"content": "", "role": "assistant", "status": "finished", "phase": "answer"}}], "response_id": "07dfb812-dd35-49df-914f-b6fe3d8369d4"}
+
